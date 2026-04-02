@@ -849,6 +849,105 @@ def _scroll_to_process_area(page, process_name: str | None, jank_category: str =
         print(f"[screenshot]   Scroll failed: {e}")
 
 
+def _get_pin_patterns(issue: IssueRegion, process_name: str | None) -> list[str]:
+    """Get regex patterns to pin for this issue type.
+
+    Uses Perfetto's PinTracksByRegex command to pin relevant tracks.
+    """
+    cat = issue.jank_category or "app_deadline"
+    proc_re = re.escape(process_name) if process_name else ".*"
+
+    # Common: always pin Actual/Expected Timeline
+    common = ["Actual Timeline", "Expected Timeline"]
+
+    category_pins = {
+        "app_deadline": [proc_re, "RenderThread", "GPU completion"],
+        "buffer_stuffing": [proc_re, "RenderThread", "surfaceflinger"],
+        "display_hal": ["surfaceflinger", "HWC", "VSYNC", proc_re],
+        "sf_cpu": ["surfaceflinger", "Binder", proc_re],
+        "sf_gpu": ["surfaceflinger", "RenderThread", "GPU", proc_re],
+        "prediction_error": ["surfaceflinger", "VSYNC", "Expected Timeline"],
+        "sf_stuffing": ["surfaceflinger", "HWC", proc_re],
+        "dropped": [proc_re, "RenderThread", "GPU completion"],
+    }
+
+    pins = common + category_pins.get(cat, [proc_re, "RenderThread"])
+    # Deduplicate while preserving order
+    seen = set()
+    result = []
+    for p in pins:
+        if p not in seen:
+            seen.add(p)
+            result.append(p)
+    return result
+
+
+def _pin_tracks_via_command(page, patterns: list[str]) -> bool:
+    """Pin tracks using Perfetto's PinTracksByRegex command.
+
+    Tries multiple API paths with timeout protection.
+    """
+    any_success = False
+    for pattern in patterns:
+        try:
+            # Use synchronous evaluate with Promise.race for timeout
+            result = page.evaluate(f"""
+                (() => {{
+                    const pattern = {json.dumps(pattern)};
+                    try {{
+                        // Method 1: Direct command API
+                        if (typeof app !== 'undefined' && app.commands) {{
+                            app.commands.runCommand('dev.perfetto.PinTracksByRegex', pattern);
+                            return {{success: true, method: 'app.commands', pattern: pattern}};
+                        }}
+                        // Method 2: Trace commands
+                        if (typeof app !== 'undefined' && app.trace && app.trace.commands) {{
+                            app.trace.commands.runCommand('dev.perfetto.PinTracksByRegex', pattern);
+                            return {{success: true, method: 'trace.commands', pattern: pattern}};
+                        }}
+                        return {{success: false, reason: 'no command API'}};
+                    }} catch(e) {{
+                        return {{success: false, reason: e.message, pattern: pattern}};
+                    }}
+                }})()
+            """)
+            if result and result.get("success"):
+                print(f"[screenshot]   Pinned: {pattern} ({result.get('method')})")
+                any_success = True
+            else:
+                reason = result.get("reason", "unknown") if result else "null"
+                if "not a function" not in reason and any_success is False:
+                    print(f"[screenshot]   Pin '{pattern}': {reason}")
+        except Exception as e:
+            if "not a function" not in str(e):
+                print(f"[screenshot]   Pin '{pattern}' error: {e}")
+    return any_success
+
+
+def _pin_tracks_via_keyboard(page, patterns: list[str]) -> bool:
+    """Fallback: pin tracks using Ctrl+Shift+P command palette."""
+    try:
+        for pattern in patterns[:4]:
+            # Open command palette
+            page.keyboard.press("Control+Shift+p")
+            time.sleep(0.8)
+
+            # Type pin command
+            focused = page.query_selector("input:focus")
+            if focused:
+                focused.fill(f"Pin track: {pattern}")
+                time.sleep(0.5)
+                page.keyboard.press("Enter")
+                time.sleep(0.5)
+            page.keyboard.press("Escape")
+            time.sleep(0.3)
+
+        return True
+    except Exception as e:
+        print(f"[screenshot]   Keyboard pin failed: {e}")
+        return False
+
+
 def capture_screenshots(
     trace_path: str,
     issues: list[IssueRegion],
@@ -857,20 +956,23 @@ def capture_screenshots(
     process_name: str | None = None,
     top_n: int = 5,
 ) -> list[ScreenshotResult]:
-    """Open Perfetto UI, load trace, pin tracks, and capture screenshots."""
+    """Open Perfetto UI, load trace, pin tracks, and capture screenshots.
+
+    Uses Perfetto's PinTracksByRegex command API to pin relevant tracks
+    (main thread, RenderThread, SurfaceFlinger, etc.) to the top of the
+    timeline view, then zooms to each jank frame and captures a screenshot.
+    """
     from playwright.sync_api import sync_playwright
 
     results: list[ScreenshotResult] = []
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Select top N issues
     selected = select_top_issues(issues, top_n)
     if not selected:
         print("[screenshot] No issues to capture after filtering")
         return results
 
     with sync_playwright() as p:
-        # Try system Chrome first, then default chromium
         try:
             browser = p.chromium.launch(headless=True, channel="chrome")
         except Exception:
@@ -894,7 +996,6 @@ def capture_screenshots(
             browser.close()
             return [ScreenshotResult(name="load_trace", file=None, success=False, error=str(e))]
 
-        # Wait for trace to fully load and render
         print("[screenshot] Waiting for trace to render...")
         time.sleep(15)
 
@@ -904,29 +1005,6 @@ def capture_screenshots(
         except Exception:
             pass
         time.sleep(1)
-
-        # Get trace time bounds
-        trace_start_ns = 0
-        trace_end_ns = 0
-        try:
-            bounds = page.evaluate("""
-                (() => {
-                    const tl = app.trace && app.trace.timeline;
-                    if (!tl || !tl.visibleWindow) return null;
-                    const vw = tl.visibleWindow;
-                    return {
-                        start: Number(typeof vw.start === 'object' ? (vw.start.integral || 0) : vw.start),
-                        duration: Number(vw.duration),
-                    };
-                })()
-            """)
-            if bounds:
-                trace_start_ns = bounds["start"]
-                trace_end_ns = trace_start_ns + bounds["duration"]
-                print(f"[screenshot] Trace bounds: {trace_start_ns} - {trace_end_ns} "
-                      f"({bounds['duration'] / 1e9:.1f}s)")
-        except Exception:
-            pass
 
         # Capture each top issue
         for i, issue in enumerate(selected):
@@ -938,15 +1016,21 @@ def capture_screenshots(
                   f"({issue.severity}, {dur_ms:.1f}ms, cat={issue.jank_category})")
 
             try:
-                # Step 1: Navigate to the precise time range
+                # Step 1: Pin relevant tracks for this issue type
+                pin_patterns = _get_pin_patterns(issue, process_name)
+                print(f"[screenshot]   Pinning tracks: {pin_patterns}")
+                pinned = _pin_tracks_via_command(page, pin_patterns)
+                if not pinned:
+                    print("[screenshot]   Command API failed, trying keyboard fallback...")
+                    _pin_tracks_via_keyboard(page, pin_patterns)
+                time.sleep(1)
+
+                # Step 2: Navigate to the precise time range
                 ts = issue.start_ns
                 dur = issue.end_ns - issue.start_ns
-                # Show 3x the issue duration for context, minimum 5ms
                 pad = max(dur, 5_000_000)
 
-                print(f"[screenshot]   Navigating to time range: "
-                      f"{ts/1e9:.6f}s - {(ts+dur)/1e9:.6f}s (pad={pad/1e6:.1f}ms)")
-
+                print(f"[screenshot]   Zooming to: {dur_ms:.1f}ms jank frame")
                 page.evaluate(f"""
                     (() => {{
                         if (app && app.trace && app.trace.scrollTo) {{
@@ -962,41 +1046,26 @@ def capture_screenshots(
                 """)
                 time.sleep(2)
 
-                # Step 2: Close bottom details panel to maximize track area
+                # Step 3: Close bottom panel and scroll to pinned area
                 _close_bottom_panel(page)
-
-                # Step 3: Expand app process group to show thread tracks
-                if i == 0:  # Only need to expand once
-                    _expand_process_tracks(page, process_name)
-                    time.sleep(1)
-
-                # Step 4: Use Perfetto search to navigate to relevant slice
-                search_term = _get_search_term(issue)
-                if search_term:
-                    print(f"[screenshot]   Searching for: '{search_term}'")
-                    _search_and_navigate(page, search_term)
-                    time.sleep(0.5)
-                    # Close bottom panel again (search may reopen it)
-                    _close_bottom_panel(page)
-
-                # Step 5: Scroll to show relevant tracks based on jank type
-                jank_cat = issue.jank_category or "app_deadline"
-                _scroll_to_process_area(page, process_name, jank_cat)
                 time.sleep(0.5)
 
-                # Step 6: Moderate zoom for detail
-                page.mouse.move(960, 400)
-                time.sleep(0.2)
-                for _ in range(10):
-                    page.mouse.wheel(0, -100)
-                    time.sleep(0.03)
-                time.sleep(1)
-
-                # Step 7: Re-scroll after zoom (zoom changes vertical position)
-                _scroll_to_process_area(page, process_name, jank_cat)
+                # Scroll track tree to top (pinned tracks should be there)
+                page.evaluate("""
+                    (() => {
+                        const selectors = [
+                            '.pf-timeline-page__scrolling-track-tree',
+                            '[class*="scrolling-track"]',
+                        ];
+                        for (const sel of selectors) {
+                            const c = document.querySelector(sel);
+                            if (c) { c.scrollTop = 0; break; }
+                        }
+                    })()
+                """)
                 time.sleep(0.5)
 
-                # Step 8: Take screenshot - clip bottom to exclude "Nothing selected" panel
+                # Step 4: Take screenshot
                 page.screenshot(
                     path=str(screenshot_path),
                     clip={"x": 0, "y": 0, "width": 1920, "height": 750},
@@ -1008,6 +1077,18 @@ def capture_screenshots(
                     success=True,
                 ))
                 print(f"[screenshot]   -> saved {screenshot_name}")
+
+                # Step 5: Unpin all tracks before next issue (clean slate)
+                page.evaluate("""
+                    (() => {
+                        // Click all unpin buttons
+                        const btns = document.querySelectorAll(
+                            'button[title*="Unpin"], button[title*="unpin"]'
+                        );
+                        btns.forEach(b => b.click());
+                    })()
+                """)
+                time.sleep(0.5)
 
             except Exception as e:
                 print(f"[screenshot]   -> FAILED: {e}")
