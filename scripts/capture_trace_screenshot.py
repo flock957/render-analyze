@@ -522,16 +522,24 @@ def _get_tracks_to_pin(issue: IssueRegion, process_name: str | None) -> list[str
 
 
 def _get_search_term(issue: IssueRegion) -> str:
-    """Get a Perfetto search term to navigate to relevant track for this issue."""
+    """Get a Perfetto search term to navigate to the relevant track.
+
+    Each jank type has a characteristic slice name. Searching for it
+    in the Perfetto omnibox causes the UI to scroll vertically to the
+    track that contains the matching slice, solving the track navigation
+    problem.
+    """
     cat = issue.jank_category or "app_deadline"
     search_map = {
+        # App issues → search in app process tracks
         "app_deadline": "Choreographer#doFrame",
         "buffer_stuffing": "dequeueBuffer",
-        "display_hal": "onMessageRefresh",
-        "sf_cpu": "onMessageRefresh",
+        # SF issues → search in SurfaceFlinger process tracks
+        "display_hal": "waiting for presentFence",  # HWC presentFence wait in SF
+        "sf_cpu": "onMessageRefresh",               # SF main thread composition
         "sf_gpu": "onMessageRefresh",
-        "prediction_error": "onMessageRefresh",
-        "sf_stuffing": "onMessageRefresh",
+        "prediction_error": "waiting for presentFence",
+        "sf_stuffing": "onMessageRefresh",               # SF stuffing
         "dropped": "Choreographer#doFrame",
     }
     return search_map.get(cat, "doFrame")
@@ -741,12 +749,12 @@ async (processName) => {
     const sfCategories = ['display_hal', 'sf_cpu', 'sf_gpu', 'sf_stuffing', 'prediction_error'];
     // Thread names to search - NO "Timeline" entries here
     const threadTerms = sfCategories.includes(jankCat)
-        ? ['SurfaceFlinger', 'surfaceflinger', 'VSYNC', 'HWC', 'hwcomposer', 'Binder']
+        ? ['waiting for presentFence', 'onMessageRefresh', 'SurfaceFlinger', 'VSYNC', 'HWC', 'Binder']
         : procName
             ? ['RenderThread', 'Choreographer', 'GPU completion', procName, 'Binder']
             : ['SurfaceFlinger', 'RenderThread', 'Binder'];
-    // Words to EXCLUDE from matches (avoid matching FrameTimeline bars)
-    const excludeTerms = ['Timeline', 'Expected', 'Actual'];
+    // Words to EXCLUDE from matches (avoid FrameTimeline bars and group headers)
+    const excludeTerms = ['Timeline', 'Expected', 'Actual', 'Default Workspace'];
 
     for (let pos = 0; pos < totalHeight; pos += step) {
         container.scrollTop = pos;
