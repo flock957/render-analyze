@@ -976,6 +976,21 @@ def capture_screenshots(
             pass
         time.sleep(1)
 
+        # Collapse FrameTimeline tracks (Expected/Actual Timeline)
+        # These expand into huge colored rectangles when zoomed in,
+        # pushing the actual thread slices (doFrame, composite etc.) off screen
+        for pat in ["Expected Timeline", "Actual Timeline"]:
+            try:
+                page.evaluate(f"""
+                    (() => {{ app.commands.runCommand('dev.perfetto.CollapseTracksByRegex', {json.dumps(pat)}); }})()
+                """)
+            except Exception:
+                pass
+        time.sleep(0.5)
+        page.keyboard.press("Escape")
+        time.sleep(0.3)
+        print("[screenshot] Collapsed FrameTimeline tracks")
+
         # Get trace time bounds
         trace_start_ns = 0
         trace_end_ns = 0
@@ -1016,7 +1031,8 @@ def capture_screenshots(
                 # Step 1: Zoom to jank frame using setVisibleWindow
                 # (scrollTo doesn't actually change visible window,
                 #  mouse wheel doesn't work in headless Chrome)
-                target_dur = int(max(dur * 3, 50_000_000))  # 3x duration or 50ms min
+                # Tight zoom: 80-150ms visible range for readable slice text
+                target_dur = int(min(max(dur * 1.2, 80_000_000), 150_000_000))
                 vis_start = int(ts - target_dur // 3)
                 visible_ms = target_dur / 1e6
 
@@ -1044,6 +1060,19 @@ def capture_screenshots(
                 # Step 3: Scroll to show relevant process tracks
                 _scroll_to_process_area(page, process_name, cat)
                 time.sleep(0.5)
+
+                # Step 3b: Scroll down extra ~250px to skip past FrameTimeline
+                # tracks (Expected/Actual Timeline expand into huge bars)
+                # and show the actual thread slices (doFrame, composite etc.)
+                page.evaluate("""
+                    (() => {
+                        const c = document.querySelector(
+                            '.pf-timeline-page__scrolling-track-tree'
+                        ) || document.querySelector('[class*="scrolling-track"]');
+                        if (c) c.scrollTop += 250;
+                    })()
+                """)
+                time.sleep(0.3)
 
                 # Step 4: Re-apply zoom (search/scroll may have shifted it)
                 page.evaluate(f"""
