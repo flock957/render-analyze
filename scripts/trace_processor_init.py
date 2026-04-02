@@ -68,7 +68,7 @@ def main():
     parser = argparse.ArgumentParser(description="Initialize Trace Processor")
     parser.add_argument("--trace", required=True, help="Path to trace file")
     parser.add_argument("--port", type=int, default=9001, help="HTTP port")
-    parser.add_argument("--output-dir", default="/workspace/perf_analysis_output")
+    parser.add_argument("--output-dir", default="/workspace/render_output")
     args = parser.parse_args()
 
     if not os.path.isfile(args.trace):

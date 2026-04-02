@@ -252,7 +252,7 @@ def parse_columns(result: dict) -> list[dict]:
     return rows
 
 
-def save_result(data: dict, filename: str, output_dir: str = "/workspace/perf_analysis_output"):
+def save_result(data: dict, filename: str, output_dir: str = "/workspace/render_output"):
     """Save result to JSON file."""
     os.makedirs(output_dir, exist_ok=True)
     filepath = os.path.join(output_dir, filename)
@@ -269,4 +269,4 @@ def print_result(data: dict):
 def add_common_args(parser: argparse.ArgumentParser):
     """Add common arguments to parser."""
     parser.add_argument("--port", type=int, default=9001, help="Trace Processor HTTP port")
-    parser.add_argument("--output-dir", default="/workspace/perf_analysis_output", help="Output directory")
+    parser.add_argument("--output-dir", default="/workspace/render_output", help="Output directory")

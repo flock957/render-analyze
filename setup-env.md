@@ -1,7 +1,11 @@
 ---
 name: setup-env
+type: knowledge
 description: 渲染性能分析环境初始化 - 自动安装所有依赖（trace_processor、playwright、chromium）
-phase: 0
+triggers:
+  - 环境初始化
+  - setup
+  - 安装依赖
 ---
 
 # 环境初始化

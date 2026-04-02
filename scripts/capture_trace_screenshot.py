@@ -7,8 +7,8 @@ to the top, zoom to precise fault time range, only capture top N issues.
 Usage:
     python3 capture_trace_screenshot.py \
         --trace /path/to/trace.perfetto-trace \
-        --analysis-dir /workspace/perf_analysis_output \
-        --output-dir /workspace/perf_analysis_output/screenshots \
+        --analysis-dir /workspace/render_output \
+        --output-dir /workspace/render_output/screenshots \
         --process-name com.ss.android.ugc.aweme \
         --top-n 5
 

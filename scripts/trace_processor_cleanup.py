@@ -11,7 +11,7 @@ import sys
 
 def main():
     parser = argparse.ArgumentParser(description="Cleanup Trace Processor")
-    parser.add_argument("--output-dir", default="/workspace/perf_analysis_output")
+    parser.add_argument("--output-dir", default="/workspace/render_output")
     args = parser.parse_args()
 
     state_file = os.path.join(args.output_dir, "tp_state.json")

@@ -137,10 +137,10 @@ python3 scripts/analyze_jank_types.py --port 9001
 
 ```bash
 python3 scripts/analyze_app_jank.py \
-  --jank-types "AppDeadlineMissed,BufferStuffing" --port 9001
+  --jank-types "App Deadline Missed,Buffer Stuffing" --port 9001
 ```
 
-**仅当 JANK_TYPES（阶段4输出）中包含 `AppDeadlineMissed` 或 `BufferStuffing` 时才执行。**
+**仅当 JANK_TYPES（阶段4输出）中包含 `App Deadline Missed` 或 `Buffer Stuffing` 时才执行。**
 如果不包含，跳过此步骤。
 
 分析内容：
@@ -151,7 +151,7 @@ python3 scripts/analyze_app_jank.py \
 
 ```bash
 python3 scripts/analyze_sf_jank.py \
-  --jank-types "SurfaceFlingerCpuDeadlineMissed,SurfaceFlingerGpuDeadlineMissed,DisplayHal,PredictionError,SurfaceFlingerScheduling,SurfaceFlingerStuffing,DroppedFrame" \
+  --jank-types "SurfaceFlinger CPU Deadline Missed,SurfaceFlinger GPU Deadline Missed,Display HAL,Prediction Error,SurfaceFlinger Scheduling,SurfaceFlinger Stuffing,Dropped Frame" \
   --port 9001
 ```
 
