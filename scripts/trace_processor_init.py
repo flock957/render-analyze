@@ -88,10 +88,12 @@ def main():
     if not _is_real_binary(tp_bin):
         cmd = [sys.executable] + cmd
 
+    # Start as independent daemon process so it survives parent exit
     proc = subprocess.Popen(
         cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
     )
 
     # Wait for ready

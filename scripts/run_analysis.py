@@ -94,16 +94,85 @@ def main():
              "Phase 0: Environment Setup", check=False, timeout=600)
 
     # ── Phase 1: Load Trace ──
-    # trace_processor_init.py starts the service and waits up to 60s for it.
-    # For large traces (>50MB) this can take a while.
-    _run([python, str(SCRIPT_DIR / "trace_processor_init.py"),
-          "--trace", str(trace_path),
-          "--port", str(port),
-          "--output-dir", str(output_dir)],
-         "Phase 1: Load Trace into trace_processor", timeout=120)
+    # Start trace_processor as a daemon process directly from the orchestrator.
+    # This avoids the subprocess-in-subprocess issue where trace_processor dies
+    # when the intermediate Python process (trace_processor_init.py) exits.
+    print(f"\n{'='*60}")
+    print(f"[Phase] Phase 1: Load Trace into trace_processor")
+    print(f"{'='*60}")
 
-    # Extra wait for trace_processor to stabilize
-    time.sleep(3)
+    # Kill any existing instance on this port
+    try:
+        import signal
+        result = subprocess.run(
+            ["fuser", f"{port}/tcp"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.stdout.strip():
+            for pid_str in result.stdout.strip().split():
+                try:
+                    os.kill(int(pid_str), signal.SIGTERM)
+                except (ValueError, ProcessLookupError):
+                    pass
+            time.sleep(1)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        # fuser not available or timed out, try direct kill
+        try:
+            subprocess.run(["kill", "-9", "$(lsof -t -i:{port})"],
+                           shell=True, capture_output=True, timeout=5)
+        except Exception:
+            pass
+        time.sleep(1)
+
+    # Find trace_processor binary
+    tp_bin = None
+    prebuilt = os.path.expanduser("~/.local/share/perfetto/prebuilts/trace_processor_shell")
+    for candidate in [prebuilt, "/usr/local/bin/trace_processor_shell", "/tmp/trace_processor_shell"]:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            tp_bin = candidate
+            break
+    if not tp_bin:
+        import shutil
+        tp_bin = shutil.which("trace_processor_shell")
+    if not tp_bin:
+        print("[FAIL] trace_processor_shell not found. Run setup_env.py first.")
+        sys.exit(1)
+
+    print(f"[INFO] Using: {tp_bin}")
+    print(f"[INFO] Loading: {trace_path} ({trace_path.stat().st_size / 1024 / 1024:.1f} MB)")
+
+    # Start as independent daemon
+    tp_proc = subprocess.Popen(
+        [tp_bin, "-D", "--http-port", str(port), str(trace_path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+    # Wait for HTTP service to be ready
+    import requests as _requests
+    for i in range(90):
+        try:
+            resp = _requests.get(f"http://localhost:{port}/status", timeout=2)
+            if resp.status_code == 200:
+                print(f"[INFO] trace_processor ready (pid={tp_proc.pid}, took {i+1}s)")
+                break
+        except Exception:
+            pass
+        time.sleep(1)
+    else:
+        print("[FAIL] trace_processor failed to start within 90s")
+        tp_proc.kill()
+        sys.exit(1)
+
+    # Save state
+    state = {
+        "status": "ready", "port": port, "pid": tp_proc.pid,
+        "trace_file": str(trace_path),
+        "file_size_mb": round(trace_path.stat().st_size / 1024 / 1024, 2),
+    }
+    (output_dir / "tp_state.json").write_text(json.dumps(state, indent=2))
+    print(json.dumps(state, indent=2))
 
     # ── Phase 2: Find Foreground Process ──
     # Note: find_foreground_process uses --output-dir

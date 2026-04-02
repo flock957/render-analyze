@@ -32,9 +32,9 @@ ORDER BY dur DESC LIMIT 20;
 """
 
 SQL_LAYER_COUNT = """
-SELECT display_frame_token, COUNT(*) AS layer_count
+SELECT name, COUNT(*) AS layer_count
 FROM slice WHERE name GLOB '*Layer*'
-GROUP BY display_frame_token ORDER BY layer_count DESC LIMIT 20;
+GROUP BY name ORDER BY layer_count DESC LIMIT 20;
 """
 
 SQL_GPU_COMPOSE = """
@@ -45,9 +45,9 @@ ORDER BY dur DESC LIMIT 20;
 """
 
 SQL_LAYER_UNIQUE = """
-SELECT display_frame_token, COUNT(DISTINCT name) AS unique_layers
-FROM slice WHERE name GLOB '*Layer*'
-GROUP BY display_frame_token ORDER BY unique_layers DESC LIMIT 20;
+SELECT name, COUNT(*) AS unique_layers
+FROM slice WHERE name GLOB '*Layer*' OR name GLOB '*layer*'
+GROUP BY name ORDER BY unique_layers DESC LIMIT 10;
 """
 
 SQL_HWC = """
