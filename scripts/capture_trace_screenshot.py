@@ -1117,7 +1117,53 @@ def capture_screenshots(
                     time.sleep(0.5)
                     print("[screenshot]   Collapsed: CPU Scheduling/Frequency/Timeline")
 
-                # Step 1: Search for the characteristic slice
+                # Step 1: Navigate to jank time using mouse position + zoom
+                # First, get trace bounds to calculate proportional position
+                bounds = page.evaluate("""
+                    (() => {
+                        const vw = app.trace.timeline.visibleWindow;
+                        return {start: Number(vw.start), dur: Number(vw.duration)};
+                    })()
+                """)
+                trace_start = bounds["start"]
+                trace_dur = bounds["dur"]
+
+                # Calculate center of jank frame as proportion of trace
+                jank_center = ts + dur / 2
+                x_ratio = (jank_center - trace_start) / trace_dur if trace_dur > 0 else 0.5
+                x_ratio = max(0.05, min(0.95, x_ratio))
+                # Map to timeline pixel range (after sidebar ~170px to ~1900px)
+                target_x = int(170 + (1900 - 170) * x_ratio)
+
+                # Calculate zoom level needed
+                # We want visible range ≈ dur * 3 (tight context)
+                target_range = max(dur * 3, 50_000_000)  # At least 50ms
+                zoom_ratio = trace_dur / target_range
+                import math
+                # Each wheel event zooms ~5%, need many steps for large ratios
+                zoom_steps = int(math.log(max(zoom_ratio, 1)) / math.log(1.05))
+                zoom_steps = min(zoom_steps, 150)  # Cap iterations
+
+                # Zoom using Perfetto's internal setVisibleWindow API
+                # with HighPrecisionTime/HighPrecisionTimeSpan constructors
+                vis_dur = int(target_range)  # Visible duration in ns
+                vis_start = int(jank_center - vis_dur / 2)
+
+                print(f"[screenshot]   Zooming to: {dur_ms:.1f}ms jank (visible: {vis_dur/1e6:.0f}ms)")
+
+                page.evaluate(f"""
+                    (() => {{
+                        const tl = app.trace.timeline;
+                        const HPT = tl.visibleWindow.start.constructor;
+                        const HPTS = tl.visibleWindow.constructor;
+                        const newStart = new HPT({vis_start}n);
+                        const target = new HPTS(newStart, {vis_dur});
+                        tl.setVisibleWindow(target);
+                    }})()
+                """)
+                time.sleep(2)
+
+                # Step 2: Search for slice to navigate vertically to thread
                 search_term = _get_search_term(issue)
                 print(f"[screenshot]   Searching for: '{search_term}'")
 
@@ -1131,44 +1177,12 @@ def capture_screenshots(
                     time.sleep(0.5)
                     page.keyboard.press("Enter")
                     time.sleep(1)
+                    page.keyboard.press("Escape")
+                    time.sleep(0.3)
 
-                # Step 2: Press 'f' to focus on selected slice
-                # In Perfetto, 'f' centers the view on the selected slice
-                # both horizontally AND vertically (scrolls to the track)
-                page.keyboard.press("Escape")  # Close search box first
-                time.sleep(0.3)
-                page.keyboard.press("f")  # Focus on selected slice
-                time.sleep(1)
-
-                # Step 3: Zoom to show context around the jank
-                # Use scrollTo for precise time range
-                pad = min(dur * 0.3, 30_000_000)  # Tight padding
-                pad = max(pad, 3_000_000)          # Min 3ms
-
-                visible_ms = (dur + 2 * pad) / 1e6
-                print(f"[screenshot]   Focusing: {dur_ms:.1f}ms jank (visible: {visible_ms:.0f}ms)")
-
-                # Use integer timestamps for BigInt conversion
-                t_start = int(ts - pad)
-                t_end = int(ts + dur + pad)
-                page.evaluate(f"""
-                    (() => {{
-                        if (app && app.trace && app.trace.scrollTo) {{
-                            app.trace.scrollTo({{
-                                time: {{
-                                    start: BigInt('{t_start}'),
-                                    end: BigInt('{t_end}')
-                                }}
-                            }});
-                        }}
-                    }})()
-                """)
-                time.sleep(1.5)
-
-                # Step 4: Close bottom panel, keep vertical position
+                # Step 3: Close bottom panel
                 page.keyboard.press("Escape")
                 time.sleep(0.2)
-                # Press 'q' to toggle bottom panel off
                 page.keyboard.press("q")
                 time.sleep(0.3)
                 time.sleep(0.5)
