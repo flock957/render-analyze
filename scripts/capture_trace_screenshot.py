@@ -850,32 +850,47 @@ def _scroll_to_process_area(page, process_name: str | None, jank_category: str =
 
 
 def _get_pin_patterns(issue: IssueRegion, process_name: str | None) -> list[str]:
-    """Get regex patterns to pin for this issue type.
+    """Get regex patterns to pin the complete rendering pipeline.
 
-    Uses Perfetto's PinTracksByRegex command to pin relevant tracks.
+    The ideal jank analysis view shows the full pipeline top-to-bottom:
+    1. App Expected/Actual Timeline (FrameTimeline)
+    2. App main thread (Choreographer.doFrame, performTraversals)
+    3. App RenderThread (GPU command submission)
+    4. GPU completion
+    5. SurfaceFlinger Expected/Actual Timeline
+    6. SurfaceFlinger main thread (commit, composite)
+
+    Uses Perfetto's PinTracksByRegex command to pin all of these.
     """
     cat = issue.jank_category or "app_deadline"
     proc_re = re.escape(process_name) if process_name else ".*"
 
-    # Common: always pin Actual/Expected Timeline
-    common = ["Actual Timeline", "Expected Timeline"]
+    # Always pin the complete rendering pipeline
+    # Order matters: first pinned = top of view
+    pipeline = [
+        "Expected Timeline",    # App + SF expected frame timing
+        "Actual Timeline",      # App + SF actual frame timing (color-coded jank)
+        proc_re,                # App process group (main thread + sub-threads)
+        "RenderThread",         # App GPU rendering thread
+        "GPU completion",       # GPU fence signals
+        "surfaceflinger",       # SF process (commit, composite, present)
+    ]
 
-    category_pins = {
-        "app_deadline": [proc_re, "RenderThread", "GPU completion"],
-        "buffer_stuffing": [proc_re, "RenderThread", "surfaceflinger"],
-        "display_hal": ["surfaceflinger", "HWC", "VSYNC", proc_re],
-        "sf_cpu": ["surfaceflinger", "Binder", proc_re],
-        "sf_gpu": ["surfaceflinger", "RenderThread", "GPU", proc_re],
-        "prediction_error": ["surfaceflinger", "VSYNC", "Expected Timeline"],
-        "sf_stuffing": ["surfaceflinger", "HWC", proc_re],
-        "dropped": [proc_re, "RenderThread", "GPU completion"],
+    # Add type-specific tracks
+    extra = {
+        "display_hal": ["HWC", "VSYNC"],
+        "sf_cpu": ["Binder"],
+        "sf_gpu": ["GPU"],
+        "prediction_error": ["VSYNC"],
+        "sf_stuffing": ["HWC"],
+        "sf_scheduling": ["VSYNC"],
     }
+    pipeline.extend(extra.get(cat, []))
 
-    pins = common + category_pins.get(cat, [proc_re, "RenderThread"])
-    # Deduplicate while preserving order
+    # Deduplicate
     seen = set()
     result = []
-    for p in pins:
+    for p in pipeline:
         if p not in seen:
             seen.add(p)
             result.append(p)
@@ -946,6 +961,91 @@ def _pin_tracks_via_keyboard(page, patterns: list[str]) -> bool:
     except Exception as e:
         print(f"[screenshot]   Keyboard pin failed: {e}")
         return False
+
+
+def _annotate_screenshot(raw_path: str, output_path: str, issue: IssueRegion):
+    """Add annotations to screenshot: title bar, jank info, highlight box.
+
+    Uses Pillow to draw:
+    - Top banner with issue name, severity, duration
+    - A colored border indicating severity (red=high, orange=medium)
+    - Bottom info bar with jank category and analysis hints
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        # Pillow not available, just copy raw to output
+        import shutil
+        shutil.copy2(raw_path, output_path)
+        os.remove(raw_path)
+        return
+
+    img = Image.open(raw_path)
+    w, h = img.size
+
+    # Crop out the bottom "Current Selection" panel area (~30% of height)
+    crop_h = int(h * 0.72)
+    img = img.crop((0, 0, w, crop_h))
+    w, h = img.size
+
+    # Create annotated image with top banner
+    banner_h = 36
+    bottom_bar_h = 28
+    annotated = Image.new("RGB", (w, h + banner_h + bottom_bar_h), (13, 17, 23))  # Dark bg
+
+    # Draw top banner
+    draw = ImageDraw.Draw(annotated)
+    severity_colors = {"high": (255, 68, 68), "medium": (255, 170, 0), "low": (68, 170, 68)}
+    sev_color = severity_colors.get(issue.severity, (136, 136, 136))
+    draw.rectangle([(0, 0), (w, banner_h)], fill=(22, 27, 34))
+
+    # Severity indicator bar
+    draw.rectangle([(0, 0), (6, banner_h)], fill=sev_color)
+
+    # Issue text
+    dur_ms = (issue.end_ns - issue.start_ns) / 1e6
+    title = f"  [{issue.severity.upper()}] {issue.name} — {dur_ms:.1f}ms"
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 14)
+        small_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 12)
+    except Exception:
+        font = ImageFont.load_default()
+        small_font = font
+    draw.text((12, 10), title, fill=(230, 237, 243), font=font)
+
+    # Paste screenshot below banner
+    annotated.paste(img, (0, banner_h))
+
+    # Draw bottom info bar
+    bar_y = banner_h + h
+    draw.rectangle([(0, bar_y), (w, bar_y + bottom_bar_h)], fill=(22, 27, 34))
+
+    # Category-specific analysis hint
+    cat = issue.jank_category or "app_deadline"
+    hints = {
+        "app_deadline": "Look: Choreographer#doFrame → performTraversals → measure/layout/draw | RenderThread GPU work",
+        "buffer_stuffing": "Look: dequeueBuffer blocked | BufferQueue full → SF consuming too slowly",
+        "display_hal": "Look: waiting for presentFence in SF | HWC/display pipeline stall",
+        "sf_cpu": "Look: SF onMessageRefresh/commit duration | lock contention | Layer count",
+        "sf_gpu": "Look: SF GPU composition fence late | RenderEngine/GLES events",
+        "prediction_error": "Look: Expected vs Actual Timeline mismatch | VSync prediction drift",
+        "sf_stuffing": "Look: SF previous frame still compositing | cascading from Display HAL delay",
+        "dropped": "Look: Frame completely missed target VSync | severe app or SF delay",
+    }
+    hint = hints.get(cat, "Analyze the pinned tracks for jank root cause")
+    draw.text((12, bar_y + 7), hint, fill=(139, 148, 158), font=small_font)
+
+    # Draw severity border
+    border_w = 2
+    for offset in range(border_w):
+        draw.rectangle(
+            [(offset, banner_h + offset), (w - 1 - offset, bar_y - 1 - offset)],
+            outline=sev_color + (128,) if len(sev_color) == 3 else sev_color
+        )
+
+    annotated.save(output_path, quality=95)
+    os.remove(raw_path)
+    print(f"[screenshot]   Annotated: {issue.severity.upper()} | {hint[:60]}...")
 
 
 def capture_screenshots(
@@ -1025,12 +1125,23 @@ def capture_screenshots(
                     _pin_tracks_via_keyboard(page, pin_patterns)
                 time.sleep(1)
 
-                # Step 2: Navigate to the precise time range
+                # Close any dialog/palette that may have opened during pinning
+                page.keyboard.press("Escape")
+                time.sleep(0.3)
+                page.keyboard.press("Escape")
+                time.sleep(0.3)
+                # Click on timeline area to dismiss any popups
+                page.mouse.click(960, 400)
+                time.sleep(0.3)
+
+                # Step 2: Navigate to the jank frame and select it
                 ts = issue.start_ns
                 dur = issue.end_ns - issue.start_ns
                 pad = max(dur, 5_000_000)
 
                 print(f"[screenshot]   Zooming to: {dur_ms:.1f}ms jank frame")
+
+                # Use scrollTo to focus the time range
                 page.evaluate(f"""
                     (() => {{
                         if (app && app.trace && app.trace.scrollTo) {{
@@ -1046,11 +1157,25 @@ def capture_screenshots(
                 """)
                 time.sleep(2)
 
-                # Step 3: Close bottom panel and scroll to pinned area
-                _close_bottom_panel(page)
-                time.sleep(0.5)
+                # Select the jank frame by timestamp to show flow arrows
+                # This highlights the frame in Actual Timeline and draws
+                # connecting arrows to SurfaceFlinger DisplayFrames
+                page.evaluate(f"""
+                    (() => {{
+                        if (app && app.trace && app.trace.scrollTo) {{
+                            app.trace.scrollTo({{
+                                time: {{
+                                    start: {ts}n,
+                                    end: {ts + dur}n,
+                                    behavior: 'focus'
+                                }}
+                            }});
+                        }}
+                    }})()
+                """)
+                time.sleep(1)
 
-                # Scroll track tree to top (pinned tracks should be there)
+                # Step 3: Scroll track tree to top (pinned tracks are there)
                 page.evaluate("""
                     (() => {
                         const selectors = [
@@ -1065,11 +1190,15 @@ def capture_screenshots(
                 """)
                 time.sleep(0.5)
 
-                # Step 4: Take screenshot
+                # Step 4: Take raw screenshot (full viewport for max track visibility)
+                raw_path = str(screenshot_path) + ".raw.png"
                 page.screenshot(
-                    path=str(screenshot_path),
-                    clip={"x": 0, "y": 0, "width": 1920, "height": 750},
+                    path=raw_path,
+                    clip={"x": 0, "y": 0, "width": 1920, "height": 1080},
                 )
+
+                # Step 5: Annotate screenshot with issue details
+                _annotate_screenshot(raw_path, str(screenshot_path), issue)
 
                 results.append(ScreenshotResult(
                     name=issue.name,
