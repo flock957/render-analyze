@@ -1086,25 +1086,35 @@ def capture_screenshots(
             pass
         time.sleep(1)
 
-        # One-time setup: collapse all, find exact track names
-        print("[screenshot] Collapsing all tracks...")
-        page.evaluate("() => { app.commands.runCommand('dev.perfetto.CollapseTracksByRegex', '.*'); }")
-        time.sleep(0.5)
+        # Step A: First EXPAND target process groups so thread tracks appear in DOM
+        if process_name:
+            page.evaluate(f"() => {{ app.commands.runCommand('dev.perfetto.ExpandTracksByRegex', {json.dumps(re.escape(process_name))}); }}")
+            time.sleep(0.5)
+        page.evaluate("() => { app.commands.runCommand('dev.perfetto.ExpandTracksByRegex', 'surfaceflinger'); }")
+        time.sleep(1)
+        page.keyboard.press("Escape")
+        time.sleep(0.3)
 
-        # Find exact track names from DOM for precise pinning
+        # Step B: Find exact track names from DOM BEFORE collapsing
+        print("[screenshot] Searching for track names in DOM...")
         track_names = page.evaluate("""
             (() => {
                 const tracks = [];
                 document.querySelectorAll('*').forEach(el => {
                     const t = el.textContent?.trim() || '';
-                    if (t.length > 3 && t.length < 60 && el.children.length < 3 &&
-                        /^(\\S+)\\s+\\d+$/.test(t)) {
+                    if (t.length > 3 && t.length < 80 && el.children.length < 3 &&
+                        /^\\S+\\s+\\d+$/.test(t)) {
                         tracks.push(t);
                     }
                 });
                 return [...new Set(tracks)];
             })()
         """)
+
+        # Step C: NOW collapse everything
+        print("[screenshot] Collapsing all tracks...")
+        page.evaluate("() => { app.commands.runCommand('dev.perfetto.CollapseTracksByRegex', '.*'); }")
+        time.sleep(0.5)
         # Find one of each: app main thread, RenderThread, surfaceflinger
         pin_map = {}
         for t in track_names:
