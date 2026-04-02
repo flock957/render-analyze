@@ -1096,80 +1096,81 @@ def capture_screenshots(
                   f"({issue.severity}, {dur_ms:.1f}ms, cat={issue.jank_category})")
 
             try:
-                # Step 1: Expand target process groups
-                # (no pinning — expand shows Timeline+threads within the group)
-                expand_targets = []
-                if process_name:
-                    expand_targets.append(re.escape(process_name))
                 cat = issue.jank_category or "app_deadline"
-                sf_cats = ["display_hal", "sf_cpu", "sf_gpu", "sf_stuffing",
-                           "prediction_error", "sf_scheduling"]
-                if cat in sf_cats:
-                    expand_targets.append("surfaceflinger")
-
-                for target in expand_targets:
-                    page.evaluate(f"""
-                        (() => {{
-                            try {{
-                                app.commands.runCommand(
-                                    'dev.perfetto.ExpandTracksByRegex', {json.dumps(target)});
-                            }} catch(e) {{}}
-                        }})()
-                    """)
-                    time.sleep(0.5)
-                print(f"[screenshot]   Expanded: {expand_targets}")
-
-                # Close any dialog and dismiss
-                page.keyboard.press("Escape")
-                time.sleep(0.2)
-                page.mouse.click(960, 400)
-                time.sleep(0.3)
-
-                # Step 2: Navigate to the jank frame
                 ts = issue.start_ns
                 dur = issue.end_ns - issue.start_ns
-                pad = max(dur, 5_000_000)
 
-                print(f"[screenshot]   Zooming to: {dur_ms:.1f}ms jank frame")
+                # Step 0: Collapse CPU tracks and FrameTimeline to maximize
+                # space for thread tracks (where the actual slice detail is)
+                if i == 0:  # Only need to do once
+                    for collapse_pat in ["Scheduling", "Frequency",
+                                         "Expected Timeline", "Actual Timeline"]:
+                        page.evaluate(f"""
+                            (() => {{
+                                try {{
+                                    app.commands.runCommand(
+                                        'dev.perfetto.CollapseTracksByRegex',
+                                        {json.dumps(collapse_pat)});
+                                }} catch(e) {{}}
+                            }})()
+                        """)
+                    time.sleep(0.5)
+                    print("[screenshot]   Collapsed: CPU Scheduling/Frequency/Timeline")
 
-                # Use scrollTo to focus the time range
-                page.evaluate(f"""
-                    (() => {{
-                        if (app && app.trace && app.trace.scrollTo) {{
-                            app.trace.scrollTo({{
-                                time: {{
-                                    start: {ts - pad}n,
-                                    end: {ts + dur + pad}n,
-                                    behavior: 'focus'
-                                }}
-                            }});
-                        }}
-                    }})()
-                """)
-                time.sleep(2)
+                # Step 1: Search for the characteristic slice
+                search_term = _get_search_term(issue)
+                print(f"[screenshot]   Searching for: '{search_term}'")
 
-                # Select the jank frame by timestamp to show flow arrows
-                # This highlights the frame in Actual Timeline and draws
-                # connecting arrows to SurfaceFlinger DisplayFrames
-                page.evaluate(f"""
-                    (() => {{
-                        if (app && app.trace && app.trace.scrollTo) {{
-                            app.trace.scrollTo({{
-                                time: {{
-                                    start: {ts}n,
-                                    end: {ts + dur}n,
-                                    behavior: 'focus'
-                                }}
-                            }});
-                        }}
-                    }})()
-                """)
+                search_box = page.query_selector('input[placeholder*="Search"]')
+                if not search_box:
+                    search_box = page.query_selector('.omnibox input, [class*="omnibox"] input')
+                if search_box:
+                    search_box.click()
+                    time.sleep(0.3)
+                    search_box.fill(search_term)
+                    time.sleep(0.5)
+                    page.keyboard.press("Enter")
+                    time.sleep(1)
+
+                # Step 2: Press 'f' to focus on selected slice
+                # In Perfetto, 'f' centers the view on the selected slice
+                # both horizontally AND vertically (scrolls to the track)
+                page.keyboard.press("Escape")  # Close search box first
+                time.sleep(0.3)
+                page.keyboard.press("f")  # Focus on selected slice
                 time.sleep(1)
 
-                # Step 3: Scroll to show the expanded process group
-                # Search for the process name in the track tree DOM
-                scroll_target = process_name or "surfaceflinger"
-                _scroll_to_process_area(page, scroll_target, cat)
+                # Step 3: Zoom to show context around the jank
+                # Use scrollTo for precise time range
+                pad = min(dur * 0.3, 30_000_000)  # Tight padding
+                pad = max(pad, 3_000_000)          # Min 3ms
+
+                visible_ms = (dur + 2 * pad) / 1e6
+                print(f"[screenshot]   Focusing: {dur_ms:.1f}ms jank (visible: {visible_ms:.0f}ms)")
+
+                # Use integer timestamps for BigInt conversion
+                t_start = int(ts - pad)
+                t_end = int(ts + dur + pad)
+                page.evaluate(f"""
+                    (() => {{
+                        if (app && app.trace && app.trace.scrollTo) {{
+                            app.trace.scrollTo({{
+                                time: {{
+                                    start: BigInt('{t_start}'),
+                                    end: BigInt('{t_end}')
+                                }}
+                            }});
+                        }}
+                    }})()
+                """)
+                time.sleep(1.5)
+
+                # Step 4: Close bottom panel, keep vertical position
+                page.keyboard.press("Escape")
+                time.sleep(0.2)
+                # Press 'q' to toggle bottom panel off
+                page.keyboard.press("q")
+                time.sleep(0.3)
                 time.sleep(0.5)
 
                 # Step 4: Take raw screenshot (full viewport for max track visibility)
