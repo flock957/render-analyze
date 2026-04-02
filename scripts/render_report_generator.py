@@ -405,6 +405,15 @@ def load_screenshots(output_dir: Path) -> dict[str, str]:
         if img_path.exists():
             img_data = base64.b64encode(img_path.read_bytes()).decode()
             screenshots[shot["name"]] = img_data
+
+    # Also load multi-shot files (e.g. 00_App Jank Frame #123_0.png, _1.png)
+    screenshots_dir = output_dir / "screenshots"
+    if screenshots_dir.exists():
+        for img_file in sorted(screenshots_dir.glob("*.png")):
+            if img_file.name not in [s.get("file") for s in manifest.get("screenshots", [])]:
+                img_data = base64.b64encode(img_file.read_bytes()).decode()
+                screenshots[img_file.stem] = img_data
+
     return screenshots
 
 
@@ -415,17 +424,25 @@ def severity_badge(severity: str) -> str:
 
 
 def screenshot_html(screenshots: dict, name_keywords: list[str]) -> str:
-    """Find and render ONE screenshot matching keywords."""
+    """Find and render ALL screenshots matching keywords (supports multi-shot)."""
+    matched = []
     for key, b64 in screenshots.items():
         for kw in name_keywords:
             if kw.lower() in key.lower():
-                return f'''
-                <div class="screenshot">
-                    <img src="data:image/png;base64,{b64}" alt="{key}"
-                         onclick="this.classList.toggle('expanded')"
-                         title="点击查看大图 / Click to enlarge" />
-                    <p class="screenshot-label">Perfetto 截图: {key}</p>
-                </div>'''
+                matched.append((key, b64))
+                break
+    if not matched:
+        return '<div class="no-screenshot">截图未生成</div>'
+    html = ''
+    for key, b64 in matched:
+        html += f'''
+            <div class="screenshot">
+                <img src="data:image/png;base64,{b64}" alt="{key}"
+                     onclick="this.classList.toggle('expanded')"
+                     title="点击查看大图 / Click to enlarge" />
+                <p class="screenshot-label">Perfetto 截图: {key}</p>
+            </div>'''
+    return html
     return '<div class="no-screenshot">截图未生成 (可能 pin 或导航失败)</div>'
 
 

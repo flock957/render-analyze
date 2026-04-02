@@ -1029,41 +1029,43 @@ def capture_screenshots(
                 cat = issue.jank_category or "app_deadline"
 
                 # Step 1: Zoom to jank frame using setVisibleWindow
-                # (scrollTo doesn't actually change visible window,
-                #  mouse wheel doesn't work in headless Chrome)
-                # Tight zoom: 80-150ms visible range for readable slice text
                 target_dur = int(min(max(dur * 1.2, 80_000_000), 150_000_000))
                 vis_start = int(ts - target_dur // 3)
                 visible_ms = target_dur / 1e6
 
-                print(f"[screenshot]   Zooming to: {dur_ms:.1f}ms jank (visible: {visible_ms:.0f}ms)")
+                def _apply_zoom():
+                    page.evaluate(f"""
+                        (() => {{
+                            const tl = app.trace.timeline;
+                            const HPT = tl.visibleWindow.start.constructor;
+                            const HPTS = tl.visibleWindow.constructor;
+                            tl.setVisibleWindow(new HPTS(new HPT({vis_start}n), {target_dur}));
+                        }})()
+                    """)
 
-                page.evaluate(f"""
-                    (() => {{
-                        const tl = app.trace.timeline;
-                        const HPT = tl.visibleWindow.start.constructor;
-                        const HPTS = tl.visibleWindow.constructor;
-                        tl.setVisibleWindow(new HPTS(new HPT({vis_start}n), {target_dur}));
-                    }})()
-                """)
+                print(f"[screenshot]   Zooming to: {dur_ms:.1f}ms jank (visible: {visible_ms:.0f}ms)")
+                _apply_zoom()
                 time.sleep(2)
 
-                # Step 2: Search for characteristic slice to scroll
-                # vertically to the relevant thread track
-                search_term = _get_search_term(issue)
-                if search_term:
-                    print(f"[screenshot]   Searching for: '{search_term}'")
-                    _search_and_navigate(page, search_term)
-                    time.sleep(0.5)
-                    _close_bottom_panel(page)
-
-                # Step 3: Scroll to show relevant process tracks
+                # Step 2: Always scroll to the APP process area first
+                # (app threads are relevant for all jank types — they show the upstream cause)
+                # Then scroll down to capture SF tracks in subsequent screenshots
+                if process_name:
+                    try:
+                        page.evaluate(f"""
+                            (() => {{ app.commands.runCommand(
+                                'dev.perfetto.ExpandTracksByRegex', {json.dumps(re.escape(process_name))}
+                            ); }})()
+                        """)
+                        time.sleep(0.5)
+                        page.keyboard.press("Escape")
+                        time.sleep(0.3)
+                    except Exception:
+                        pass
                 _scroll_to_process_area(page, process_name, cat)
                 time.sleep(0.5)
 
-                # Step 3b: Scroll down extra ~250px to skip past FrameTimeline
-                # tracks (Expected/Actual Timeline expand into huge bars)
-                # and show the actual thread slices (doFrame, composite etc.)
+                # Step 2b: Skip past FrameTimeline bars to thread slices
                 page.evaluate("""
                     (() => {
                         const c = document.querySelector(
@@ -1074,26 +1076,43 @@ def capture_screenshots(
                 """)
                 time.sleep(0.3)
 
-                # Step 4: Re-apply zoom (search/scroll may have shifted it)
-                page.evaluate(f"""
-                    (() => {{
-                        const tl = app.trace.timeline;
-                        const HPT = tl.visibleWindow.start.constructor;
-                        const HPTS = tl.visibleWindow.constructor;
-                        tl.setVisibleWindow(new HPTS(new HPT({vis_start}n), {target_dur}));
-                    }})()
-                """)
+                # Step 3: Re-apply zoom and take MULTIPLE screenshots
+                # (scroll down between each to show different track levels)
+                _apply_zoom()
                 time.sleep(1)
 
-                # Step 5: Take raw screenshot
-                raw_path = str(screenshot_path) + ".raw.png"
-                page.screenshot(
-                    path=raw_path,
-                    clip={"x": 0, "y": 0, "width": 1920, "height": 1080},
-                )
+                shot_files = []
+                num_shots = 2  # 2 vertical slices per issue
+                for shot_idx in range(num_shots):
+                    suffix = f"_{shot_idx}" if num_shots > 1 else ""
+                    shot_name = f"{i:02d}_{issue.name}{suffix}.png"
+                    raw_path = str(output_dir / shot_name) + ".raw.png"
+                    final_path = str(output_dir / shot_name)
 
-                # Step 6: Annotate with Pillow
-                _annotate_screenshot(raw_path, str(screenshot_path), issue)
+                    page.screenshot(
+                        path=raw_path,
+                        clip={"x": 0, "y": 0, "width": 1920, "height": 1080},
+                    )
+                    _annotate_screenshot(raw_path, final_path, issue)
+                    shot_files.append(shot_name)
+                    print(f"[screenshot]   -> saved {shot_name}")
+
+                    # Scroll down for next vertical slice
+                    if shot_idx < num_shots - 1:
+                        page.evaluate("""
+                            (() => {
+                                const c = document.querySelector(
+                                    '.pf-timeline-page__scrolling-track-tree'
+                                ) || document.querySelector('[class*="scrolling-track"]');
+                                if (c) c.scrollTop += 350;
+                            })()
+                        """)
+                        time.sleep(0.5)
+                        _apply_zoom()
+                        time.sleep(0.5)
+
+                # Use first shot as the main screenshot for the manifest
+                screenshot_path = output_dir / shot_files[0]
 
                 results.append(ScreenshotResult(
                     name=issue.name,
