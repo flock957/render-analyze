@@ -54,67 +54,93 @@ FRAMEWORK_ANALYSIS = {
     "app_deadline": {
         "title": "App Deadline Missed - 应用侧帧超时根因分析",
         "call_chain": [
+            "VSYNC-app 信号到达",
             "Choreographer.doFrame()",
-            "ViewRootImpl.doTraversal()",
-            "ViewRootImpl.performTraversals()",
-            "performMeasure() / performLayout() / performDraw()",
-            "ThreadedRenderer.draw() → syncFrameState → nSyncAndDrawFrame",
+            "  → INPUT callbacks (处理触摸/按键事件)",
+            "  → ANIMATION callbacks (属性动画/过渡动画)",
+            "  → TRAVERSAL: ViewRootImpl.performTraversals()",
+            "    → performMeasure() → performLayout() → performDraw()",
+            "  → ThreadedRenderer.draw() → syncFrameState",
+            "RenderThread: nSyncAndDrawFrame → issueDrawCommands",
+            "RenderThread: queueBuffer → 提交给 SurfaceFlinger",
         ],
         "source_refs": [
             ("Choreographer.java", "frameworks/base/core/java/android/view/Choreographer.java",
-             "doFrame() 接收 VSYNC 信号后依次分发 INPUT → ANIMATION → TRAVERSAL 回调。"
-             "如果任一回调耗时过长，帧总时间超过 VSYNC 间隔 (16.6ms@60Hz / 11.1ms@90Hz)，"
-             "FrameTimeline 标记为 JANK_APP_DEADLINE_MISSED。"),
+             "doFrame() 接收 VSYNC-app 信号后依次分发 INPUT → ANIMATION → TRAVERSAL 回调。"
+             "帧起点 = doFrame 开始，终点 = max(GPU完成时间, queueBuffer时间)。"
+             "如果总时间超过 VSYNC 间隔 (16.6ms@60Hz / 11.1ms@90Hz)，标记为 JANK_APP_DEADLINE_MISSED。"),
             ("ViewRootImpl.java", "frameworks/base/core/java/android/view/ViewRootImpl.java",
              "performTraversals() 是帧渲染主入口，依次执行 measure → layout → draw。"
-             "深层 View 层级或复杂自定义 View 的 onMeasure/onLayout 是常见瓶颈。"),
+             "Trace 中看 'performTraversals' slice 内部哪个阶段耗时最长即为瓶颈。"
+             "常见: measure/layout 慢 → View 层级问题; draw 慢 → Canvas 绘制过重。"),
             ("ThreadedRenderer.java", "frameworks/base/core/java/android/view/ThreadedRenderer.java",
              "draw() 将 DisplayList 同步到 RenderThread (syncFrameState)，"
              "然后 RenderThread 执行 nSyncAndDrawFrame 提交 GPU 指令。"
-             "如果主线程 draw 阶段耗时长，说明 DisplayList 构建过重。"),
+             "Trace 中看 'syncFrameState' 耗时 → 主线程和 RenderThread 的同步开销。"),
+        ],
+        "trace_diagnosis": [
+            "在 Perfetto 中定位 Actual Timeline 的红色帧，查看对应的 `Choreographer#doFrame` slice",
+            "展开 doFrame 内部: 检查 input/animation/traversal 各阶段耗时占比",
+            "检查 `performTraversals` 内 measure vs layout vs draw 哪个最长",
+            "检查 RenderThread 的 `DrawFrame` / `syncFrameState` 耗时",
+            "检查主线程是否有 `Binder.transact`、`GC`、`JIT compiling` 等阻塞 slice",
+            "检查线程状态: Running (绿色) vs Sleeping (蓝色) vs Runnable (白色) vs Uninterruptible (橙色)",
         ],
         "root_causes": [
-            "**View 层级过深**: performMeasure/performLayout 需要递归遍历整个 View 树，"
-            "层级每多一层，measure/layout 开销指数增长",
-            "**onDraw 过重**: Canvas 绑定了大量绘制指令 (drawBitmap/drawPath 等)，"
-            "导致 DisplayList 构建时间过长",
-            "**主线程阻塞**: doFrame 之前有 Input 或 Animation 回调占用了大量时间，"
-            "导致 TRAVERSAL 回调启动时已接近 deadline",
-            "**GC / JIT**: 运行时垃圾回收或 JIT 编译暂停主线程",
+            "**Measure/Layout 过重**: View 层级深、RelativeLayout 嵌套、RecyclerView 多类型 item",
+            "**Draw 过重**: Canvas.drawBitmap/drawPath 指令多, 自定义 View onDraw 复杂",
+            "**Input/Animation 回调耗时**: 触摸事件处理或动画计算占用了大部分帧时间",
+            "**主线程 I/O 阻塞**: SharedPreferences.commit()、数据库查询、文件读写",
+            "**主线程 Binder 调用**: 同步 IPC 等待远端进程响应 (ContentProvider/Service)",
+            "**GC / JIT**: 运行时垃圾回收暂停 (concurrent GC 影响小但 full GC 影响大)，JIT 编译暂停",
+            "**锁竞争**: synchronized/ReentrantLock 等待其他线程释放锁",
         ],
         "optimizations": [
-            "使用 `ConstraintLayout` 减少嵌套层级，避免 `RelativeLayout` 嵌套",
-            "RecyclerView 使用 `setHasFixedSize(true)` + DiffUtil 减少无效 layout",
-            "将耗时 Bitmap 解码移到子线程，使用 Glide/Coil 的异步加载",
-            "使用 `RenderThread` 动画 (ViewPropertyAnimator) 替代主线程动画",
-            "排查主线程 I/O: SharedPreferences.commit() → apply(), 数据库操作移到子线程",
+            "使用 `ConstraintLayout` 减少嵌套层级，避免 `RelativeLayout` 嵌套导致双 measure",
+            "RecyclerView: `setHasFixedSize(true)` + DiffUtil + 预创建 ViewHolder",
+            "将耗时 Bitmap 解码移到子线程，使用 Glide/Coil 异步加载",
+            "主线程 I/O: SharedPreferences.commit() → apply(), 数据库操作移到子线程",
+            "使用 `ViewPropertyAnimator` 或 `RenderThread` 动画替代主线程动画",
+            "减少 `Canvas.saveLayer()` 调用（触发 offscreen buffer 分配）",
+            "使用 Systrace/Perfetto 标记 `Trace.beginSection()` 定位业务代码瓶颈",
         ],
     },
     "buffer_stuffing": {
         "title": "Buffer Stuffing - BufferQueue 塞满根因分析",
         "call_chain": [
-            "App: ThreadedRenderer.nSyncAndDrawFrame()",
-            "App: Surface.dequeueBuffer() → BufferQueueProducer.dequeueBuffer()",
-            "App: 等待 SurfaceFlinger 消费 buffer",
-            "SF: BufferLayerConsumer.acquireBuffer() → latchBuffer()",
+            "App RenderThread: nSyncAndDrawFrame → issueDrawCommands",
+            "App RenderThread: Surface.queueBuffer() → 提交 buffer 给 BufferQueue",
+            "App RenderThread: Surface.dequeueBuffer() → 尝试获取下一个空 buffer",
+            "  → BufferQueueProducer.dequeueBuffer() 阻塞（所有 slot 被占）",
+            "SF: onMessageRefresh → acquireBuffer() → latchBuffer() → 消费 buffer",
         ],
         "source_refs": [
             ("BufferQueueProducer.cpp", "frameworks/native/libs/gui/BufferQueueProducer.cpp",
              "dequeueBuffer() 在 BufferQueue 所有 slot 被占用时阻塞。"
              "Triple buffering (3 buffers) 下，如果 SF 合成慢导致前两帧还没消费，"
-             "第三帧 dequeue 就会阻塞 App 的 RenderThread。"),
+             "第三帧 dequeue 就会阻塞 App 的 RenderThread。"
+             "Trace 中表现为 'dequeueBuffer' slice 持续 > 5ms。"),
             ("BufferLayerConsumer.cpp", "frameworks/native/libs/gui/BufferLayerConsumer.cpp",
              "SurfaceFlinger 在 onMessageRefresh 中调用 acquireBuffer 消费 buffer。"
              "如果 SF 侧合成延迟（Display HAL 或 GPU 合成慢），消费速度跟不上生产速度。"),
         ],
+        "trace_diagnosis": [
+            "检查 RenderThread 的 `dequeueBuffer` slice 耗时（正常 < 1ms，阻塞时 > 5ms）",
+            "检查 Actual Timeline: 帧是否标记为 'Late Present' 但 on_time_finish=true",
+            "检查 SF Actual Timeline 是否有对应的延迟（黄色帧表示 SF 导致的卡顿）",
+            "检查 SF 的 `onMessageRefresh` / `commit` / `composite` 总耗时",
+            "通常与 Display HAL / SF Stuffing 同时出现，需要联合分析",
+        ],
         "root_causes": [
             "**SurfaceFlinger 消费慢**: SF 合成时间长（层数多/GPU 合成回退），buffer 消费速度低于生产速度",
-            "**App 渲染过快**: 连续帧渲染耗时短但 SF 来不及消费，比如快速滑动场景",
-            "**Display HAL 延迟**: presentFence 信号延迟导致 buffer 无法及时释放回 BufferQueue",
+            "**Display HAL 级联**: presentFence 延迟 → buffer 无法释放 → dequeueBuffer 阻塞",
+            "**App 连续快速渲染**: fling/动画场景下 App 渲染速度 > SF 消费速度",
+            "**GPU 合成回退**: HWC 无法处理某些 Layer，回退到 GPU 合成导致 SF 耗时增加",
         ],
         "optimizations": [
-            "检查是否存在 Display HAL 延迟（通常是联合问题）",
+            "优先排查 Display HAL / SF 侧延迟 — Buffer Stuffing 通常是下游问题的级联",
             "减少 Layer 数量降低 SF 合成时间",
+            "检查 `dumpsys SurfaceFlinger --comp-type` 确认是否有 GPU 合成回退",
             "如果 App 侧无 deadline missed，问题主要在 SF/Display 侧",
         ],
     },
@@ -122,134 +148,233 @@ FRAMEWORK_ANALYSIS = {
         "title": "Display HAL - 显示硬件延迟根因分析",
         "call_chain": [
             "SurfaceFlinger.onMessageRefresh()",
+            "  → commit() → composite() → presentDisplay()",
             "HWComposer.presentAndGetReleaseFences()",
-            "HWC HAL: presentDisplay()",
+            "HWC HAL: presentDisplay() → 提交帧到显示控制器",
             "Kernel: DRM/KMS → Display Controller → Panel",
-            "等待 presentFence 信号",
+            "返回 presentFence → SF 在下一帧等待此 fence",
         ],
         "source_refs": [
             ("HWComposer.cpp", "frameworks/native/services/surfaceflinger/DisplayHardware/HWComposer.cpp",
              "presentAndGetReleaseFences() 调用 HWC HAL 的 presentDisplay()，"
              "HAL 返回一个 presentFence。SF 在下一帧开始时等待这个 fence 信号。"
-             "如果 fence 信号延迟 (> 1 VSYNC)，说明显示硬件处理慢。"),
+             "Trace 中关键 slice: 'waiting for presentFence NNN'（NNN 是 fence ID）。"),
             ("SurfaceFlinger.cpp", "frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp",
-             "postComposition() 中检查 presentFence。trace 中表现为 "
-             "'waiting for presentFence XXX' slice 时间过长（正常应 < 1ms）。"
-             "如果持续出现 > 16ms 的 presentFence 等待，说明显示 pipeline 有瓶颈。"),
+             "postComposition() 中检查 presentFence。"
+             "正常 presentFence 等待 < 1ms（fence 已在上一帧完成时 signal）。"
+             "如果持续 > 16ms，说明显示硬件未能在一个 VSYNC 内完成帧呈现。"),
+        ],
+        "trace_diagnosis": [
+            "在 SF 进程中搜索 'waiting for presentFence' slice，检查耗时（正常 < 1ms）",
+            "检查 SF Actual Timeline 帧颜色: 红色 = SF 导致的 jank",
+            "检查 'HWC::presentDisplay' 或 'hwc_commit' slice 耗时",
+            "检查 SF commit/composite 总耗时是否正常（正常 < 5ms）",
+            "如果 commit/composite 正常但 presentFence 慢 → 硬件问题",
+            "如果 commit/composite 也慢 → 可能是 Layer 太多导致 HWC 回退 GPU",
         ],
         "root_causes": [
-            "**HWC 驱动问题**: 硬件合成器 (HWC) 处理 layer 合成时间过长，"
-            "特别是在多 layer overlay 回退到 GPU 合成时",
-            "**DDR 带宽竞争**: 显示控制器读取 framebuffer 时与 CPU/GPU 内存访问竞争",
-            "**Panel 刷新异常**: 显示面板刷新率切换 (如 60→90→120Hz) 导致 VSYNC 间隔不稳定",
-            "**Thermal 降频**: 温度过高导致 GPU/Display 频率降低",
+            "**HWC overlay 回退**: Layer 类型/数量超出 HWC 能力，回退到 GPU 合成",
+            "**DDR 带宽竞争**: 显示控制器读 framebuffer 与 CPU/GPU 内存访问竞争",
+            "**Panel 刷新率切换**: 60→90→120Hz 切换导致 VSYNC 间隔不稳定",
+            "**Thermal 降频**: 高温导致 GPU/Display 频率降低，帧呈现变慢",
+            "**HWC 驱动 bug**: 厂商 HWC HAL 实现问题（常见于低端机/旧驱动）",
         ],
         "optimizations": [
-            "检查 HWC 合成方式：`dumpsys SurfaceFlinger --comp-type` 确认是否 GPU 回退",
-            "减少 overlay layer 数量，确保关键 layer 走 HWC 合成",
-            "检查 DDR 频率和带宽：`cat /sys/class/devfreq/*/cur_freq`",
-            "排查 thermal throttling: `dumpsys thermalservice`",
+            "检查 HWC 合成方式: `dumpsys SurfaceFlinger --comp-type` 确认是否 GPU 回退",
+            "减少 overlay layer 数量，确保关键 layer 走 HWC 硬件合成",
+            "检查 DDR 频率: `cat /sys/class/devfreq/*/cur_freq`",
+            "排查 thermal: `dumpsys thermalservice` 看是否触发降频",
             "联系硬件厂商确认 HWC 驱动是否有已知问题",
         ],
     },
     "sf_cpu": {
         "title": "SF CPU Deadline Missed - SurfaceFlinger 主线程超时根因分析",
         "call_chain": [
+            "VSYNC-sf 信号到达",
             "SurfaceFlinger.onMessageRefresh()",
-            "handleTransaction() → 处理 Layer 状态变更",
-            "handleComposition() → Layer 合成计算",
-            "postComposition() → fence 管理",
+            "  → handleTransaction(): 处理 App 提交的 Surface 状态变更",
+            "  → handleComposition(): 计算 Layer 可见区域/混合模式/变换矩阵",
+            "  → composite(): GPU 或 HWC 合成",
+            "  → postComposition(): fence 管理、帧统计",
         ],
         "source_refs": [
             ("SurfaceFlinger.cpp", "frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp",
-             "onMessageRefresh() 是 SF 的主帧循环。当总处理时间超过 VSYNC 间隔时，"
-             "display frame 被标记为 SF_CPU_DEADLINE_MISSED。"
-             "handleTransaction 处理 App 提交的 Surface 状态变更，Layer 数量多时开销大。"),
+             "onMessageRefresh() 是 SF 的主帧循环，对应 VSYNC-sf 信号。"
+             "当总处理时间超过 VSYNC 间隔时标记为 SF_CPU_DEADLINE_MISSED。"
+             "Trace 中看 'onMessageRefresh' 或 'commit' + 'composite' slice 总时长。"),
             ("CompositionEngine.cpp", "frameworks/native/services/surfaceflinger/CompositionEngine/",
-             "handleComposition 计算每个 Layer 的可见区域、混合模式、变换矩阵等。"
-             "Layer 数量是核心性能因子 — 每多一个 Layer，合成计算增加约 0.1-0.5ms。"),
+             "handleComposition 计算每个 Layer 的可见区域、混合模式。"
+             "Layer 数量是核心因子 — 每多一个 Layer 约增加 0.1-0.5ms。"
+             "Trace 中检查 'composite layers' 或 'RenderEngine' 相关 slice。"),
+        ],
+        "trace_diagnosis": [
+            "在 SF 进程找 'onMessageRefresh' / 'commit' / 'composite' slice",
+            "检查 'handleTransaction' 耗时 — Layer 状态变更处理",
+            "检查 'composite layers' 耗时 — 合成计算",
+            "检查 SF 线程状态: 是否有 Runnable (排队等 CPU) 或 Uninterruptible (等 I/O)",
+            "检查 SF Binder 线程的 'setTransactionState' — 频繁事务导致锁竞争",
+            "Layer 数量: `dumpsys SurfaceFlinger --list` 查看当前 Layer 列表",
         ],
         "root_causes": [
-            "**Layer 数量过多**: App 使用了大量独立 Surface (多窗口/画中画/浮窗)，SF 合成计算开销大",
-            "**锁竞争**: SF 主线程等待 mStateLock，被 Binder 线程 (setTransactionState) 阻塞",
-            "**CPU 调度**: SF 线程 (SCHED_FIFO) 被高优先级中断或 RT 任务抢占",
+            "**Layer 数量过多**: App 大量独立 Surface (多窗口/画中画/浮窗/SurfaceView)",
+            "**锁竞争**: SF 主线程等待 mStateLock，被 Binder 线程 setTransactionState 阻塞",
+            "**CPU 调度**: SF 线程被高优先级中断或 RT 任务抢占，处于 Runnable 状态",
+            "**GPU 合成回退**: HWC 无法合成某些 Layer，回退到 GPU (RenderEngine) 合成",
         ],
         "optimizations": [
-            "减少 Layer 数量：合并不必要的 SurfaceView，使用 TextureView 替代",
-            "检查 SF 线程调度：`ps -eT -o pid,tid,cls,rtprio,comm | grep surfaceflinger`",
-            "检查 Binder 事务频率：频繁 setTransactionState 增加锁竞争",
+            "减少 Layer: 合并不必要的 SurfaceView，使用 TextureView 替代",
+            "检查 SF 调度: `ps -eT -o pid,tid,cls,rtprio,comm | grep surfaceflinger`",
+            "减少 Binder 事务频率（减少 setTransactionState 调用）",
+            "检查 GPU 合成: `dumpsys SurfaceFlinger --comp-type` 看是否有 CLIENT (GPU) 合成",
+        ],
+    },
+    "sf_gpu": {
+        "title": "SF GPU Deadline Missed - SurfaceFlinger GPU 合成超时根因分析",
+        "call_chain": [
+            "SurfaceFlinger.composite()",
+            "  → RenderEngine::drawLayers() (GPU 合成路径)",
+            "  → OpenGL/Vulkan 指令提交",
+            "GPU 执行合成",
+            "GPU fence signal → 合成完成",
+        ],
+        "source_refs": [
+            ("RenderEngine.cpp", "frameworks/native/libs/renderengine/",
+             "当 HWC 无法处理某些 Layer（如 YUV 格式、特殊混合模式、旋转等），"
+             "SF 回退到 GPU 合成 (RenderEngine)。GPU 指令提交后通过 fence 等待完成。"
+             "如果 GPU fence 未在 deadline 前 signal，标记为 SF_GPU_DEADLINE_MISSED。"),
+            ("HWComposer.cpp", "frameworks/native/services/surfaceflinger/DisplayHardware/HWComposer.cpp",
+             "validateDisplay() 决定每个 Layer 走 HWC overlay 还是 GPU 合成。"
+             "HWC_COMPOSITION_CLIENT 表示 GPU 合成。Layer 越多/越复杂，GPU 合成越慢。"),
+        ],
+        "trace_diagnosis": [
+            "检查 SF 的 'RenderEngine' / 'GLES' / 'drawLayers' slice 耗时",
+            "检查 GPU completion track — fence signal 是否延迟",
+            "检查 'validateDisplay' 后有多少 Layer 走了 CLIENT (GPU) 合成",
+            "SF Actual Timeline 帧如果 on_time_finish=false 且 gpu_composition=true → GPU 瓶颈",
+            "检查 GPU 频率: `cat /sys/class/devfreq/*/cur_freq` (是否被 thermal 降频)",
+        ],
+        "root_causes": [
+            "**GPU 合成 Layer 过多**: 大量 Layer 回退到 GPU 合成，GPU 负载过重",
+            "**GPU 降频**: Thermal throttling 导致 GPU 频率降低",
+            "**复杂合成**: Layer 使用了 GPU 才能处理的特性（YUV、特殊 blend mode、旋转）",
+            "**GPU 被 App 占用**: App 的 RenderThread GPU 工作与 SF GPU 合成竞争 GPU 资源",
+        ],
+        "optimizations": [
+            "减少 CLIENT 合成 Layer: 避免使用 GPU-only 特性（如 SurfaceView rotation）",
+            "降低分辨率或 Layer 尺寸减少 GPU 填充率压力",
+            "检查 GPU 频率和 thermal: `dumpsys thermalservice`",
+            "减少 overdraw: 确保不透明 Layer 设置 opaque flag",
         ],
     },
     "prediction_error": {
         "title": "Prediction Error - VSync 预测错误根因分析",
         "call_chain": [
             "VSyncPredictor.nextAnticipatedVSyncTimeFrom()",
-            "FrameTimeline: expectedVsync vs actualPresent",
-            "Scheduler.onExpectedPresentTimePosted()",
+            "  → 线性回归模型预测下一个 VSYNC 时间",
+            "FrameTimeline: 比较 expectedVsync vs actualPresent",
+            "  → 偏差超过阈值 → 标记 PredictionError",
         ],
         "source_refs": [
             ("VSyncPredictor.cpp", "frameworks/native/services/surfaceflinger/Scheduler/VSyncPredictor.cpp",
-             "VSyncPredictor 使用线性回归模型预测下一个 VSYNC 时间。"
-             "当实际 VSYNC 与预测偏差超过阈值时，FrameTimeline 标记为 PredictionError。"
-             "通常发生在 VSYNC 间隔不稳定时（如显示模式切换）。"),
+             "VSyncPredictor 使用线性回归模型基于历史 VSYNC 时间戳预测下一个 VSYNC。"
+             "当实际 present 时间与预测偏差超过 half-VSYNC 时，标记为 PredictionError。"
+             "模型需要几帧来适应刷新率变化。"),
+            ("Scheduler.cpp", "frameworks/native/services/surfaceflinger/Scheduler/Scheduler.cpp",
+             "Scheduler 管理 VSYNC-app 和 VSYNC-sf 的 phase offset。"
+             "当刷新率切换时，phase offset 需要重新计算，过渡期容易出现预测错误。"),
+        ],
+        "trace_diagnosis": [
+            "检查 Expected Timeline vs Actual Timeline: 帧的预期时间窗口和实际时间是否偏差大",
+            "检查是否有刷新率切换事件 (60→90→120Hz)",
+            "检查 VSYNC 信号间隔是否稳定",
+            "PredictionError 帧通常在 Actual Timeline 显示为浅绿色（高延迟但平滑）",
+            "通常是系统级问题，App 侧无法直接修复",
         ],
         "root_causes": [
-            "**显示模式切换**: 刷新率变化 (60↔90↔120Hz) 导致 VSYNC 间隔突变，预测模型来不及适应",
-            "**不规则帧提交**: App 帧提交间隔不均匀，VSYNC 偏移 (phase offset) 不准",
+            "**刷新率切换**: 60↔90↔120Hz 变化导致 VSYNC 间隔突变，预测模型来不及适应",
+            "**不规则帧提交**: App 帧提交间隔不均匀，VSYNC phase offset 不准",
             "**Thermal 降频**: GPU/Display 频率变化影响 VSYNC 节奏",
+            "**多进程干扰**: 多个 App 同时渲染导致 VSYNC 调度混乱",
         ],
         "optimizations": [
-            "检查显示模式：`dumpsys SurfaceFlinger | grep 'active mode'`",
-            "如果频繁模式切换，考虑锁定刷新率",
-            "Prediction Error 通常是系统级问题，App 侧影响有限",
+            "检查刷新率: `dumpsys SurfaceFlinger | grep 'active mode'`",
+            "锁定刷新率避免频繁切换: `Surface.setFrameRate()`",
+            "PredictionError 通常是系统级问题，App 侧可通过稳定帧率间接改善",
         ],
     },
     "sf_stuffing": {
         "title": "SF Stuffing - SurfaceFlinger 侧帧堆积根因分析",
         "call_chain": [
-            "SurfaceFlinger 收到新帧但上一帧还未完成",
-            "Display frame duration > 1 VSYNC interval",
-            "连续帧堆积导致延迟累加",
+            "SF: 上一帧的 composite/present 还未完成",
+            "  → 新的 VSYNC-sf 到达",
+            "  → 新帧的 commit 被延迟",
+            "Display frame 实际持续时间 > 1 VSYNC 间隔",
+            "连续帧堆积 → 延迟累加 → 用户感知卡顿",
         ],
         "source_refs": [
             ("FrameTimeline.cpp", "frameworks/native/services/surfaceflinger/FrameTimeline/FrameTimeline.cpp",
-             "当 SurfaceFlinger 的 display frame 实际持续时间超过预期时，"
-             "被标记为 SurfaceFlingerStuffing。与 Display HAL 延迟经常伴随出现 — "
-             "HAL 慢导致上一帧卡住，新帧只能排队等待。"),
+             "当 SF 的 display frame 实际持续时间超过预期时，"
+             "标记为 SurfaceFlingerStuffing。典型场景: 上一帧的 presentFence 延迟,"
+             "导致 SF 开始处理新帧时已经晚于 VSYNC-sf。"
+             "Trace 中表现为 SF Actual Timeline 连续多帧持续时间 > 16.6ms。"),
+        ],
+        "trace_diagnosis": [
+            "检查 SF Actual Timeline: 是否有连续多帧 > 1 VSYNC 间隔",
+            "检查前一帧的 'waiting for presentFence' 是否超时 — 通常是级联原因",
+            "检查 SF 的 commit/composite 自身耗时是否正常",
+            "如果 SF 自身工作 < 5ms 但帧持续时间 > 16ms → Display HAL 级联",
+            "如果 SF 自身工作 > 16ms → SF CPU 瓶颈",
         ],
         "root_causes": [
-            "**Display HAL 级联**: presentFence 延迟导致 SF 帧堆积，通常与 Display HAL Jank 共存",
-            "**SF 合成慢**: 上一帧的 GPU 合成还未完成，新帧被迫等待",
+            "**Display HAL 级联**: presentFence 延迟 → 上一帧卡住 → 新帧排队",
+            "**SF CPU 瓶颈级联**: SF 合成慢 → 上一帧未完成 → 新帧 stuffing",
+            "**GPU 合成延迟**: GPU fence 信号晚 → 上一帧 composite 阶段延迟",
         ],
         "optimizations": [
-            "优先排查 Display HAL 和 SF CPU 问题 — SF Stuffing 通常是它们的级联效应",
-            "减少 Layer 数量降低每帧合成时间",
+            "SF Stuffing 是级联效应，优先排查上游根因:",
+            "  → 如果伴随 Display HAL: 排查 HWC/驱动/thermal",
+            "  → 如果伴随 SF CPU: 减少 Layer 数量",
+            "  → 如果伴随 SF GPU: 减少 GPU 合成回退",
         ],
     },
     "dropped": {
         "title": "Dropped Frame - 帧丢弃根因分析",
         "call_chain": [
-            "App 提交帧 → SurfaceFlinger 收到",
-            "帧的 target present time 已过",
-            "SF 丢弃该帧，使用更新的帧替代",
+            "App 提交帧 → queueBuffer → BufferQueue",
+            "SF acquireBuffer → 获取帧",
+            "帧的 target present time 已过 (错过了目标 VSYNC)",
+            "BufferQueue 中有更新的帧可用",
+            "SF 丢弃旧帧，使用最新帧 → 用户感知跳帧",
         ],
         "source_refs": [
             ("FrameTimeline.cpp", "frameworks/native/services/surfaceflinger/FrameTimeline/FrameTimeline.cpp",
-             "当帧的实际 present 时间远超目标 present 时间，且有更新的帧可用时，"
-             "旧帧被丢弃。Dropped Frame 是最严重的 jank 类型 — 用户会感知到明显卡顿。"),
+             "Dropped Frame 是最严重的 jank 类型。当帧错过目标 VSYNC 且有更新帧时，"
+             "旧帧被丢弃。Trace 中 Actual Timeline 显示为蓝色帧。"
+             "用户感知: 动画/滑动中突然跳了一帧，视觉上「抖动」。"),
             ("SurfaceFlinger.cpp", "frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp",
-             "在 handlePageFlip 中，SF 从 BufferQueue acquire 最新 buffer。"
-             "如果队列中有多个 pending buffer，旧 buffer 会被跳过 (dropped)。"),
+             "handlePageFlip 中，SF 从 BufferQueue acquire 最新 buffer。"
+             "如果队列中有多个 pending buffer，旧 buffer 被跳过 (dropped)。"),
+        ],
+        "trace_diagnosis": [
+            "Actual Timeline 中蓝色帧 = Dropped Frame",
+            "检查被 drop 的帧对应的 App doFrame 耗时 — 是否 > 2 VSYNC",
+            "检查是否有连续多帧 drop — 严重卡顿的标志",
+            "检查 App 主线程是否有长 slice (Binder/GC/I/O) 阻塞了多帧",
+            "检查 SF 侧是否有 Display HAL / GPU 延迟导致消费慢",
+            "Dropped Frame 通常是其他 jank 类型的严重后果",
         ],
         "root_causes": [
-            "**严重的 App 侧 Jank**: 连续多帧超时导致 buffer 堆积，旧帧被丢弃",
-            "**SF 侧严重延迟**: SF 合成严重滞后，多个帧排队后只取最新帧",
+            "**严重 App 侧 Jank**: 连续多帧 doFrame > 2 VSYNC，buffer 堆积后旧帧被丢弃",
+            "**SF 侧严重延迟**: SF 合成严重滞后，多帧排队后只取最新帧",
             "**系统负载过高**: CPU/GPU 资源不足导致渲染 pipeline 整体延迟",
+            "**主线程完全阻塞**: ANR 级别的阻塞 (> 100ms) 导致连续多帧被 drop",
         ],
         "optimizations": [
-            "Dropped Frame 通常是其他 Jank 类型的严重后果，需要先解决上游问题",
-            "检查 App 侧 doFrame 耗时 → 如果 > 2 VSYNC，优化主线程工作量",
-            "检查系统负载：`top -d 1` 看 CPU 使用率",
+            "Dropped Frame 是「症状」不是「原因」— 需要先解决上游 jank:",
+            "  → 检查 App doFrame 耗时，优化主线程工作量",
+            "  → 检查是否有 Binder/GC/I/O 导致的主线程长阻塞",
+            "  → 检查系统负载: `top -d 1` 看 CPU 使用率",
+            "  → 检查 SF 侧 Display HAL / GPU 延迟",
         ],
     },
 }
@@ -354,6 +479,14 @@ def framework_analysis_html(category: str) -> str:
             <p>{desc}</p>
         </div>'''
     html += '</div>'
+
+    # Trace diagnosis guide
+    trace_diag = info.get("trace_diagnosis", [])
+    if trace_diag:
+        html += '<div class="trace-diagnosis"><h5>Perfetto Trace 诊断指南</h5><ul>'
+        for step in trace_diag:
+            html += f'<li>{step}</li>'
+        html += '</ul></div>'
 
     # Root causes
     html += '<div class="root-causes"><h5>可能的根因</h5><ul>'
@@ -505,6 +638,10 @@ tr:hover td {{ background: #161b22; }}
 .source-file code {{ color: #79c0ff; font-weight: 600; font-size: 14px; }}
 .source-path {{ color: #484f58; font-size: 12px; margin-left: 8px; }}
 .source-ref p {{ font-size: 13px; line-height: 1.5; color: #c9d1d9; }}
+.trace-diagnosis {{ margin: 12px 0; }}
+.trace-diagnosis ul {{ list-style: none; padding: 0; }}
+.trace-diagnosis li {{ padding: 5px 0 5px 20px; font-size: 13px; color: #c9d1d9; position: relative; border-bottom: 1px solid #1a2332; }}
+.trace-diagnosis li::before {{ content: ">>"; position: absolute; left: 0; color: #58a6ff; font-family: monospace; }}
 .root-causes ul {{ list-style: none; padding: 0; }}
 .root-causes li {{ padding: 6px 0; font-size: 14px; border-bottom: 1px solid #21262d; }}
 .root-causes li:last-child {{ border-bottom: none; }}
