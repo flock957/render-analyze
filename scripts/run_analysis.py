@@ -94,19 +94,24 @@ def main():
              "Phase 0: Environment Setup", check=False, timeout=600)
 
     # ── Phase 1: Load Trace ──
+    # trace_processor_init.py starts the service and waits up to 60s for it.
+    # For large traces (>50MB) this can take a while.
     _run([python, str(SCRIPT_DIR / "trace_processor_init.py"),
           "--trace", str(trace_path),
           "--port", str(port),
           "--output-dir", str(output_dir)],
-         "Phase 1: Load Trace into trace_processor")
+         "Phase 1: Load Trace into trace_processor", timeout=120)
+
+    # Extra wait for trace_processor to stabilize
+    time.sleep(3)
 
     # ── Phase 2: Find Foreground Process ──
+    # Note: find_foreground_process uses --output-dir
     _run([python, str(SCRIPT_DIR / "find_foreground_process.py"),
           "--port", str(port),
           "--output-dir", str(output_dir)],
          "Phase 2: Find Foreground Process", check=False)
 
-    # Read process name from output
     process_name = None
     target_json = _load_json(output_dir / "target_process.json")
     if target_json:
@@ -114,15 +119,15 @@ def main():
         print(f"[INFO] Target process: {process_name}")
 
     # ── Phase 3: Initialize Jank Metrics ──
+    # Note: uses RENDER_OUTPUT env var (set above), not --output-dir
     _run([python, str(SCRIPT_DIR / "init_render_jank_metric.py"),
-          "--port", str(port),
-          "--output-dir", str(output_dir)],
+          "--port", str(port)],
          "Phase 3: Initialize Jank Metrics")
 
     # ── Phase 4: Analyze Jank Types ──
+    # Note: uses RENDER_OUTPUT env var
     _run([python, str(SCRIPT_DIR / "analyze_jank_types.py"),
-          "--port", str(port),
-          "--output-dir", str(output_dir)],
+          "--port", str(port)],
          "Phase 4: Analyze Jank Type Distribution")
 
     # Read jank types to decide which analyses to run
@@ -138,31 +143,33 @@ def main():
         print(f"[INFO] Detected {len(type_names)} jank types: {', '.join(sorted(type_names))}")
 
     # ── Phase 5: App Jank Analysis ──
-    # Check if app-level jank types exist
     all_types_str = " ".join(str(t) for t in detected_types)
-    has_app_jank = any(k in all_types_str for k in ["App Deadline", "Buffer Stuffing", "AppDeadlineMissed", "BufferStuffing"])
+    has_app_jank = any(k in all_types_str for k in [
+        "App Deadline", "Buffer Stuffing", "AppDeadlineMissed", "BufferStuffing"
+    ])
 
     if has_app_jank:
+        # Note: uses RENDER_OUTPUT env var
+        # Jank type names must match what trace_processor returns (with spaces)
         _run([python, str(SCRIPT_DIR / "analyze_app_jank.py"),
-              "--jank-types", "AppDeadlineMissed,BufferStuffing",
-              "--port", str(port),
-              "--output-dir", str(output_dir)],
+              "--jank-types", "App Deadline Missed,Buffer Stuffing",
+              "--port", str(port)],
              "Phase 5: App Layer Jank Analysis")
     else:
         print("\n[SKIP] Phase 5: No app-level jank types detected")
 
     # ── Phase 6: SF Jank Analysis ──
-    sf_types = "SurfaceFlingerCpuDeadlineMissed,SurfaceFlingerGpuDeadlineMissed,DisplayHal,PredictionError,SurfaceFlingerScheduling,SurfaceFlingerStuffing,DroppedFrame"
+    sf_types = "SurfaceFlinger CPU Deadline Missed,SurfaceFlinger GPU Deadline Missed,Display HAL,Prediction Error,SurfaceFlinger Scheduling,SurfaceFlinger Stuffing,Dropped Frame"
     has_sf_jank = any(k in all_types_str for k in [
         "SurfaceFlinger", "Display HAL", "DisplayHal", "Prediction",
         "Dropped", "SF", "Unknown"
     ])
 
     if has_sf_jank:
+        # Note: uses RENDER_OUTPUT env var
         _run([python, str(SCRIPT_DIR / "analyze_sf_jank.py"),
               "--jank-types", sf_types,
-              "--port", str(port),
-              "--output-dir", str(output_dir)],
+              "--port", str(port)],
              "Phase 6: SurfaceFlinger Jank Analysis")
     else:
         print("\n[SKIP] Phase 6: No SF-level jank types detected")
