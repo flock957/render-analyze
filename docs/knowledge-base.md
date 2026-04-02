@@ -255,6 +255,97 @@ GROUP BY state ORDER BY total_ms DESC;
 
 ---
 
+## 三级 Jank 分类体系
+
+```
+Level 1: 位置      Level 2: 组件           Level 3: 根因
+───────────────────────────────────────────────────────────────
+App 层             主线程 (UI Thread)      measure/layout 过重 (View 层级深)
+                                           draw 过重 (overdraw/复杂 Path)
+                                           input 处理阻塞 (触摸事件回调重)
+                                           animation 超时 (属性动画/过渡动画)
+                                           Binder IPC 阻塞 (同步跨进程调用)
+                                           GC 暂停 (内存分配频繁)
+                                           锁竞争 (synchronized/ReentrantLock)
+
+                   RenderThread            GPU draw 慢 (shader 复杂/纹理大)
+                                           纹理上传慢 (大 Bitmap 首次使用)
+                                           syncFrameState 延迟 (DisplayList 过大)
+                                           dequeueBuffer 阻塞 (Buffer Stuffing)
+
+SF 层              CPU 合成                Layer 数量过多 (> 20)
+                                           GPU 合成回退 (CLIENT composition)
+                                           锁竞争 (mStateLock/Binder)
+
+                   GPU 合成                保护内容路径 (DRM protected layers)
+                                           复杂混合模式 (特殊 blend mode)
+                                           Layer 数量超出 HWC 能力
+
+                   调度                     SF 线程被抢占
+                                           VSYNC phase offset 不准
+
+Display 层         HWC                     Thermal 降频 (GPU/Display 频率低)
+                                           面板刷新异常 (刷新率切换)
+                                           HWC 驱动 bug
+
+系统级             Buffer Stuffing         Triple buffering 溢出
+                   Prediction Error        VSYNC 预测不准
+```
+
+## HWUI JankTracker 指标
+
+通过 `adb shell dumpsys gfxinfo <package>` 可获取的额外指标：
+
+| 指标 | 阈值 | 说明 |
+|------|------|------|
+| Missed Vsync | > 50% 帧间隔 | 帧开始延迟超过 VSYNC |
+| High input latency | > 50% 帧间隔 | 输入事件处理过慢 |
+| Slow UI thread | > deadline | 主线程工作超出预算 |
+| Slow bitmap uploads | > 3.5ms | GPU 纹理上传耗时 |
+| Slow issue draw commands | > deadline | RenderThread 绘制指令慢 |
+| Frame deadline missed | actualEnd > deadline | 帧整体超时 |
+| Slow RT Sync | > 8ms | 主线程与 RenderThread 同步慢 |
+
+## Perfetto trace 采集配置（推荐完整版）
+
+```protobuf
+buffers: { size_kb: 131072 fill_policy: RING_BUFFER }
+data_sources: {
+  config {
+    name: "linux.ftrace"
+    ftrace_config {
+      ftrace_events: "sched/sched_switch"
+      ftrace_events: "sched/sched_waking"
+      ftrace_events: "sched/sched_blocked_reason"
+      ftrace_events: "power/suspend_resume"
+      ftrace_events: "power/cpu_frequency"
+      ftrace_events: "power/gpu_frequency"
+      ftrace_events: "dmabuf_heap/dma_heap_stat"
+      ftrace_events: "gpu_mem/gpu_mem_total"
+      atrace_categories: "view"
+      atrace_categories: "gfx"
+      atrace_categories: "sched"
+      atrace_categories: "freq"
+      atrace_categories: "binder_driver"
+      atrace_apps: "*"
+    }
+  }
+}
+data_sources: { config { name: "android.surfaceflinger.frametimeline" } }
+data_sources: {
+  config {
+    name: "linux.process_stats"
+    process_stats_config {
+      scan_all_processes_on_start: true
+      proc_stats_poll_ms: 1000
+    }
+  }
+}
+duration_ms: 20000
+```
+
+---
+
 ## AOSP 源码索引
 
 | 组件 | 关键文件 | 关键函数 |
