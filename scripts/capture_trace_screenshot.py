@@ -849,6 +849,77 @@ def _scroll_to_process_area(page, process_name: str | None, jank_category: str =
         print(f"[screenshot]   Scroll failed: {e}")
 
 
+def _annotate_screenshot(raw_path: str, output_path: str, issue: IssueRegion):
+    """Add annotation overlay: title bar + severity border + diagnosis hint."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        import shutil
+        shutil.copy2(raw_path, output_path)
+        os.remove(raw_path)
+        return
+
+    img = Image.open(raw_path)
+    w, h = img.size
+
+    # Crop bottom 28% (Current Selection panel)
+    crop_h = int(h * 0.72)
+    img = img.crop((0, 0, w, crop_h))
+    w, h = img.size
+
+    banner_h = 36
+    bottom_h = 28
+    annotated = Image.new("RGB", (w, h + banner_h + bottom_h), (13, 17, 23))
+    draw = ImageDraw.Draw(annotated)
+
+    sev_colors = {"high": (255, 68, 68), "medium": (255, 170, 0), "low": (68, 170, 68)}
+    sev_color = sev_colors.get(issue.severity, (136, 136, 136))
+
+    # Top banner
+    draw.rectangle([(0, 0), (w, banner_h)], fill=(22, 27, 34))
+    draw.rectangle([(0, 0), (6, banner_h)], fill=sev_color)
+
+    dur_ms = (issue.end_ns - issue.start_ns) / 1e6
+    title = f"  [{issue.severity.upper()}] {issue.name} - {dur_ms:.1f}ms"
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 14)
+        small_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 12)
+    except Exception:
+        font = ImageFont.load_default()
+        small_font = font
+    draw.text((12, 10), title, fill=(230, 237, 243), font=font)
+
+    # Paste screenshot
+    annotated.paste(img, (0, banner_h))
+
+    # Bottom hint bar
+    bar_y = banner_h + h
+    draw.rectangle([(0, bar_y), (w, bar_y + bottom_h)], fill=(22, 27, 34))
+    hints = {
+        "app_deadline": "Look: Choreographer#doFrame > performTraversals > measure/layout/draw | RenderThread GPU work",
+        "buffer_stuffing": "Look: dequeueBuffer blocked | BufferQueue full > SF consuming too slowly",
+        "display_hal": "Look: waiting for presentFence in SF | HWC/display pipeline stall",
+        "sf_cpu": "Look: SF onMessageRefresh/commit duration | lock contention | Layer count",
+        "sf_gpu": "Look: SF GPU composition fence late | RenderEngine/GLES events",
+        "prediction_error": "Look: Expected vs Actual Timeline mismatch | VSync prediction drift",
+        "sf_stuffing": "Look: SF previous frame still compositing | cascading from Display HAL delay",
+        "dropped": "Look: Frame completely missed target VSync | severe app or SF delay",
+    }
+    hint = hints.get(issue.jank_category or "app_deadline", "Analyze pinned tracks for root cause")
+    draw.text((12, bar_y + 7), hint, fill=(139, 148, 158), font=small_font)
+
+    # Severity border
+    for offset in range(2):
+        draw.rectangle(
+            [(offset, banner_h + offset), (w - 1 - offset, bar_y - 1 - offset)],
+            outline=sev_color
+        )
+
+    annotated.save(output_path, quality=95)
+    os.remove(raw_path)
+    print(f"[screenshot]   Annotated: {issue.severity.upper()} | {hint[:60]}...")
+
+
 def capture_screenshots(
     trace_path: str,
     issues: list[IssueRegion],
@@ -938,69 +1009,62 @@ def capture_screenshots(
                   f"({issue.severity}, {dur_ms:.1f}ms, cat={issue.jank_category})")
 
             try:
-                # Step 1: Navigate to the precise time range
                 ts = issue.start_ns
                 dur = issue.end_ns - issue.start_ns
-                # Show 3x the issue duration for context, minimum 5ms
-                pad = max(dur, 5_000_000)
+                cat = issue.jank_category or "app_deadline"
 
-                print(f"[screenshot]   Navigating to time range: "
-                      f"{ts/1e9:.6f}s - {(ts+dur)/1e9:.6f}s (pad={pad/1e6:.1f}ms)")
+                # Step 1: Zoom to jank frame using setVisibleWindow
+                # (scrollTo doesn't actually change visible window,
+                #  mouse wheel doesn't work in headless Chrome)
+                target_dur = int(max(dur * 3, 50_000_000))  # 3x duration or 50ms min
+                vis_start = int(ts - target_dur // 3)
+                visible_ms = target_dur / 1e6
+
+                print(f"[screenshot]   Zooming to: {dur_ms:.1f}ms jank (visible: {visible_ms:.0f}ms)")
 
                 page.evaluate(f"""
                     (() => {{
-                        if (app && app.trace && app.trace.scrollTo) {{
-                            app.trace.scrollTo({{
-                                time: {{
-                                    start: {ts - pad}n,
-                                    end: {ts + dur + pad}n,
-                                    behavior: 'focus'
-                                }}
-                            }});
-                        }}
+                        const tl = app.trace.timeline;
+                        const HPT = tl.visibleWindow.start.constructor;
+                        const HPTS = tl.visibleWindow.constructor;
+                        tl.setVisibleWindow(new HPTS(new HPT({vis_start}n), {target_dur}));
                     }})()
                 """)
                 time.sleep(2)
 
-                # Step 2: Close bottom details panel to maximize track area
-                _close_bottom_panel(page)
-
-                # Step 3: Expand app process group to show thread tracks
-                if i == 0:  # Only need to expand once
-                    _expand_process_tracks(page, process_name)
-                    time.sleep(1)
-
-                # Step 4: Use Perfetto search to navigate to relevant slice
+                # Step 2: Search for characteristic slice to scroll
+                # vertically to the relevant thread track
                 search_term = _get_search_term(issue)
                 if search_term:
                     print(f"[screenshot]   Searching for: '{search_term}'")
                     _search_and_navigate(page, search_term)
                     time.sleep(0.5)
-                    # Close bottom panel again (search may reopen it)
                     _close_bottom_panel(page)
 
-                # Step 5: Scroll to show relevant tracks based on jank type
-                jank_cat = issue.jank_category or "app_deadline"
-                _scroll_to_process_area(page, process_name, jank_cat)
+                # Step 3: Scroll to show relevant process tracks
+                _scroll_to_process_area(page, process_name, cat)
                 time.sleep(0.5)
 
-                # Step 6: Moderate zoom for detail
-                page.mouse.move(960, 400)
-                time.sleep(0.2)
-                for _ in range(10):
-                    page.mouse.wheel(0, -100)
-                    time.sleep(0.03)
+                # Step 4: Re-apply zoom (search/scroll may have shifted it)
+                page.evaluate(f"""
+                    (() => {{
+                        const tl = app.trace.timeline;
+                        const HPT = tl.visibleWindow.start.constructor;
+                        const HPTS = tl.visibleWindow.constructor;
+                        tl.setVisibleWindow(new HPTS(new HPT({vis_start}n), {target_dur}));
+                    }})()
+                """)
                 time.sleep(1)
 
-                # Step 7: Re-scroll after zoom (zoom changes vertical position)
-                _scroll_to_process_area(page, process_name, jank_cat)
-                time.sleep(0.5)
-
-                # Step 8: Take screenshot - clip bottom to exclude "Nothing selected" panel
+                # Step 5: Take raw screenshot
+                raw_path = str(screenshot_path) + ".raw.png"
                 page.screenshot(
-                    path=str(screenshot_path),
-                    clip={"x": 0, "y": 0, "width": 1920, "height": 750},
+                    path=raw_path,
+                    clip={"x": 0, "y": 0, "width": 1920, "height": 1080},
                 )
+
+                # Step 6: Annotate with Pillow
+                _annotate_screenshot(raw_path, str(screenshot_path), issue)
 
                 results.append(ScreenshotResult(
                     name=issue.name,
