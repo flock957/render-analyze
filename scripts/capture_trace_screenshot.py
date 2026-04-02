@@ -1086,6 +1086,38 @@ def capture_screenshots(
             pass
         time.sleep(1)
 
+        # One-time setup: collapse all, find exact track names
+        print("[screenshot] Collapsing all tracks...")
+        page.evaluate("() => { app.commands.runCommand('dev.perfetto.CollapseTracksByRegex', '.*'); }")
+        time.sleep(0.5)
+
+        # Find exact track names from DOM for precise pinning
+        track_names = page.evaluate("""
+            (() => {
+                const tracks = [];
+                document.querySelectorAll('*').forEach(el => {
+                    const t = el.textContent?.trim() || '';
+                    if (t.length > 3 && t.length < 60 && el.children.length < 3 &&
+                        /^(\\S+)\\s+\\d+$/.test(t)) {
+                        tracks.push(t);
+                    }
+                });
+                return [...new Set(tracks)];
+            })()
+        """)
+        # Find one of each: app main thread, RenderThread, surfaceflinger
+        pin_map = {}
+        for t in track_names:
+            parts = t.split()
+            name = parts[0] if parts else ""
+            if process_name and name == process_name and "main" not in pin_map:
+                pin_map["main"] = t
+            elif name == "RenderThread" and "render" not in pin_map:
+                pin_map["render"] = t
+            elif name == "surfaceflinger" and "sf" not in pin_map:
+                pin_map["sf"] = t
+        print(f"[screenshot] Track map: {pin_map}")
+
         # Capture each top issue
         for i, issue in enumerate(selected):
             screenshot_name = f"{i:02d}_{issue.name}.png"
@@ -1099,23 +1131,6 @@ def capture_screenshots(
                 cat = issue.jank_category or "app_deadline"
                 ts = issue.start_ns
                 dur = issue.end_ns - issue.start_ns
-
-                # Step 0: Collapse CPU tracks and FrameTimeline to maximize
-                # space for thread tracks (where the actual slice detail is)
-                if i == 0:  # Only need to do once
-                    for collapse_pat in ["Scheduling", "Frequency",
-                                         "Expected Timeline", "Actual Timeline"]:
-                        page.evaluate(f"""
-                            (() => {{
-                                try {{
-                                    app.commands.runCommand(
-                                        'dev.perfetto.CollapseTracksByRegex',
-                                        {json.dumps(collapse_pat)});
-                                }} catch(e) {{}}
-                            }})()
-                        """)
-                    time.sleep(0.5)
-                    print("[screenshot]   Collapsed: CPU Scheduling/Frequency/Timeline")
 
                 # Step 1: Navigate to jank time using mouse position + zoom
                 # First, get trace bounds to calculate proportional position
@@ -1163,27 +1178,32 @@ def capture_screenshots(
                 """)
                 time.sleep(2)
 
-                # Step 2: Search for slice to navigate vertically to thread
-                search_term = _get_search_term(issue)
-                print(f"[screenshot]   Searching for: '{search_term}'")
+                # Step 2: Unpin previous, pin tracks for THIS issue type
+                page.evaluate("() => { document.querySelectorAll('button[title*=\"Unpin\"]').forEach(b => b.click()); }")
+                time.sleep(0.3)
 
-                search_box = page.query_selector('input[placeholder*="Search"]')
-                if not search_box:
-                    search_box = page.query_selector('.omnibox input, [class*="omnibox"] input')
-                if search_box:
-                    search_box.click()
-                    time.sleep(0.3)
-                    search_box.fill(search_term)
-                    time.sleep(0.5)
-                    page.keyboard.press("Enter")
-                    time.sleep(1)
-                    page.keyboard.press("Escape")
-                    time.sleep(0.3)
+                sf_cats = ["display_hal", "sf_cpu", "sf_gpu", "sf_stuffing",
+                           "prediction_error", "sf_scheduling"]
+                pins_to_use = []
+                if cat in sf_cats:
+                    # SF issues: show SF main + app main
+                    if "sf" in pin_map: pins_to_use.append(pin_map["sf"])
+                    if "main" in pin_map: pins_to_use.append(pin_map["main"])
+                else:
+                    # App issues: show app main + RenderThread
+                    if "main" in pin_map: pins_to_use.append(pin_map["main"])
+                    if "render" in pin_map: pins_to_use.append(pin_map["render"])
+                # Always add SF for pipeline context
+                if "sf" in pin_map and pin_map["sf"] not in pins_to_use:
+                    pins_to_use.append(pin_map["sf"])
 
-                # Step 3: Close bottom panel
+                for pin in pins_to_use:
+                    escaped = re.escape(pin)
+                    page.evaluate(f"() => {{ app.commands.runCommand('dev.perfetto.PinTracksByRegex', '^{escaped}$'); }}")
+                    time.sleep(0.2)
+                print(f"[screenshot]   Pinned: {pins_to_use}")
+
                 page.keyboard.press("Escape")
-                time.sleep(0.2)
-                page.keyboard.press("q")
                 time.sleep(0.3)
                 time.sleep(0.5)
 
