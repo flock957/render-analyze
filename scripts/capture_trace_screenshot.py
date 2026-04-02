@@ -850,42 +850,22 @@ def _scroll_to_process_area(page, process_name: str | None, jank_category: str =
 
 
 def _get_pin_patterns(issue: IssueRegion, process_name: str | None) -> list[str]:
-    """Get regex patterns to pin the complete rendering pipeline.
+    """Get pin patterns — EMPTY list (no pinning).
 
-    The ideal jank analysis view shows the full pipeline top-to-bottom:
-    1. App Expected/Actual Timeline (FrameTimeline)
-    2. App main thread (Choreographer.doFrame, performTraversals)
-    3. App RenderThread (GPU command submission)
-    4. GPU completion
-    5. SurfaceFlinger Expected/Actual Timeline
-    6. SurfaceFlinger main thread (commit, composite)
+    Strategy: Don't pin any tracks. Instead, use ExpandTracksByRegex to
+    expand the target process group, then scroll to show it. The process
+    group naturally contains:
+    - Expected/Actual Timeline (FrameTimeline for THIS process only)
+    - main thread (Choreographer#doFrame, performTraversals)
+    - RenderThread (DrawFrame, syncFrameState)
+    - GPU completion
+    - Binder threads
 
-    Uses Perfetto's PinTracksByRegex command to pin all of these.
+    This avoids the problem of pinning ALL Expected/Actual Timelines
+    across all processes (which fills the entire view).
     """
-    cat = issue.jank_category or "app_deadline"
-    proc_re = re.escape(process_name) if process_name else ".*"
-
-    # Always pin the complete rendering pipeline
-    # Order matters: first pinned = top of view
-    pipeline = [
-        "Expected Timeline",    # App + SF expected frame timing
-        "Actual Timeline",      # App + SF actual frame timing (color-coded jank)
-        proc_re,                # App process group (main thread + sub-threads)
-        "RenderThread",         # App GPU rendering thread
-        "GPU completion",       # GPU fence signals
-        "surfaceflinger",       # SF process (commit, composite, present)
-    ]
-
-    # Add type-specific tracks
-    extra = {
-        "display_hal": ["HWC", "VSYNC"],
-        "sf_cpu": ["Binder"],
-        "sf_gpu": ["GPU"],
-        "prediction_error": ["VSYNC"],
-        "sf_stuffing": ["HWC"],
-        "sf_scheduling": ["VSYNC"],
-    }
-    pipeline.extend(extra.get(cat, []))
+    # No pinning — rely on expand + scroll instead
+    pipeline = []
 
     # Deduplicate
     seen = set()
@@ -1116,25 +1096,36 @@ def capture_screenshots(
                   f"({issue.severity}, {dur_ms:.1f}ms, cat={issue.jank_category})")
 
             try:
-                # Step 1: Pin relevant tracks for this issue type
-                pin_patterns = _get_pin_patterns(issue, process_name)
-                print(f"[screenshot]   Pinning tracks: {pin_patterns}")
-                pinned = _pin_tracks_via_command(page, pin_patterns)
-                if not pinned:
-                    print("[screenshot]   Command API failed, trying keyboard fallback...")
-                    _pin_tracks_via_keyboard(page, pin_patterns)
-                time.sleep(1)
+                # Step 1: Expand target process groups
+                # (no pinning — expand shows Timeline+threads within the group)
+                expand_targets = []
+                if process_name:
+                    expand_targets.append(re.escape(process_name))
+                cat = issue.jank_category or "app_deadline"
+                sf_cats = ["display_hal", "sf_cpu", "sf_gpu", "sf_stuffing",
+                           "prediction_error", "sf_scheduling"]
+                if cat in sf_cats:
+                    expand_targets.append("surfaceflinger")
 
-                # Close any dialog/palette that may have opened during pinning
+                for target in expand_targets:
+                    page.evaluate(f"""
+                        (() => {{
+                            try {{
+                                app.commands.runCommand(
+                                    'dev.perfetto.ExpandTracksByRegex', {json.dumps(target)});
+                            }} catch(e) {{}}
+                        }})()
+                    """)
+                    time.sleep(0.5)
+                print(f"[screenshot]   Expanded: {expand_targets}")
+
+                # Close any dialog and dismiss
                 page.keyboard.press("Escape")
-                time.sleep(0.3)
-                page.keyboard.press("Escape")
-                time.sleep(0.3)
-                # Click on timeline area to dismiss any popups
+                time.sleep(0.2)
                 page.mouse.click(960, 400)
                 time.sleep(0.3)
 
-                # Step 2: Navigate to the jank frame and select it
+                # Step 2: Navigate to the jank frame
                 ts = issue.start_ns
                 dur = issue.end_ns - issue.start_ns
                 pad = max(dur, 5_000_000)
@@ -1175,19 +1166,10 @@ def capture_screenshots(
                 """)
                 time.sleep(1)
 
-                # Step 3: Scroll track tree to top (pinned tracks are there)
-                page.evaluate("""
-                    (() => {
-                        const selectors = [
-                            '.pf-timeline-page__scrolling-track-tree',
-                            '[class*="scrolling-track"]',
-                        ];
-                        for (const sel of selectors) {
-                            const c = document.querySelector(sel);
-                            if (c) { c.scrollTop = 0; break; }
-                        }
-                    })()
-                """)
+                # Step 3: Scroll to show the expanded process group
+                # Search for the process name in the track tree DOM
+                scroll_target = process_name or "surfaceflinger"
+                _scroll_to_process_area(page, scroll_target, cat)
                 time.sleep(0.5)
 
                 # Step 4: Take raw screenshot (full viewport for max track visibility)
