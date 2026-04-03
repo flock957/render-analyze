@@ -1090,7 +1090,9 @@ def capture_screenshots(
                     print(f"[screenshot]   SQL: {issue_desc[:70]}")
 
                 # Step 3: Define multi-view screenshot plan
-                # Each view = (label, pin_tracks, zoom_start, zoom_dur)
+                # Each view = (label, expand_target, zoom_start, zoom_dur, extra_scroll)
+                # Key change: EXPAND process groups instead of pinning individual tracks
+                # Expanded groups show all threads with nested slice stacks
                 sf_cats = ["display_hal", "sf_cpu", "sf_gpu", "sf_stuffing",
                            "prediction_error", "sf_scheduling"]
 
@@ -1104,55 +1106,23 @@ def capture_screenshots(
 
                 views = []
 
-                # View 1: App pipeline (main + RenderThread + SF)
-                app_pins = []
-                if "main" in pin_map: app_pins.append(pin_map["main"])
-                if "render" in pin_map: app_pins.append(pin_map["render"])
-                if "sf" in pin_map: app_pins.append(pin_map["sf"])
-                if app_pins:
-                    views.append(("App渲染管线", app_pins, t_start, t_dur))
+                # View 1: App process expanded (main thread + RenderThread + binder etc.)
+                if process_name:
+                    views.append(("App进程详情", process_name, t_start, t_dur, 250))
 
-                # View 2: SF detail (SF only, tighter zoom for slice readability)
-                if "sf" in pin_map:
-                    sf_dur = min(t_dur, 60_000_000)  # Max 60ms for SF detail
-                    sf_start = t_start + (t_dur - sf_dur) // 2  # Center
-                    views.append(("SF合成细节", [pin_map["sf"]], sf_start, sf_dur))
+                # View 2: SF process expanded (commit/composite/present + HWC + binder)
+                views.append(("SF进程详情", "surfaceflinger", t_start,
+                              min(t_dur, 60_000_000), 250))
 
-                # View 3: Blocking chain (from SQL analysis)
-                blocking = target.get("blocking_chain", [])
-                if blocking:
-                    block_pins = []
-                    for b in blocking[:2]:
-                        tname = f"{b['thread_name']} {b['tid']}"
-                        # Check if this track exists in discovered tracks
-                        for tn in track_names:
-                            if b['thread_name'] in tn:
-                                block_pins.append(tn)
-                                break
-                    if "sf" in pin_map and pin_map["sf"] not in block_pins:
-                        block_pins.insert(0, pin_map["sf"])
-                    if block_pins:
-                        views.append(("阻塞链", block_pins, t_start, t_dur))
+                # View 3: SF process deeper (HWC workers, composer, binder threads)
+                if cat in sf_cats:
+                    views.append(("SF关联线程", "surfaceflinger", t_start,
+                                  min(t_dur, 80_000_000), 500))
 
                 print(f"[screenshot]   Views: {[v[0] for v in views]}")
 
                 # Step 4: Helper functions
                 from PIL import Image, ImageDraw, ImageFont
-
-                def _unpin_all():
-                    page.evaluate("""() => {
-                        document.querySelectorAll('button[title*="Unpin"]').forEach(b => b.click());
-                    }""")
-                    time.sleep(0.3)
-
-                def _pin(track_list):
-                    for name in track_list:
-                        escaped = re.escape(name)
-                        page.evaluate(f"""() => {{ app.commands.runCommand(
-                            'dev.perfetto.PinTracksByRegex', '^{escaped}$'); }}""")
-                        time.sleep(0.2)
-                    page.keyboard.press("Escape")
-                    time.sleep(0.3)
 
                 def _zoom(start, duration):
                     page.evaluate(f"""(() => {{
@@ -1163,35 +1133,44 @@ def capture_screenshots(
                     }})()""")
                     time.sleep(1.5)
 
-                def _get_pinned_height():
-                    h = page.evaluate("""(() => {
-                        const els = document.querySelectorAll('[class*="pinned"], [class*="Pinned"]');
-                        let m = 0;
-                        for (const e of els) {
-                            const r = e.getBoundingClientRect();
-                            if (r.height > 50 && r.top < 600) m = Math.max(m, r.bottom);
-                        }
-                        return m || 500;
-                    })()""")
-                    return min(int(h) + 20, 650)
+                def _collapse_all():
+                    page.evaluate("""() => {
+                        app.commands.runCommand('dev.perfetto.CollapseTracksByRegex', '.*');
+                    }""")
+                    time.sleep(0.5)
 
-                def _take_and_annotate(raw_path, final_path, label, pin_names):
-                    page.screenshot(path=raw_path, clip={"x": 0, "y": 0, "width": 1920, "height": 1080})
+                def _expand(pattern):
+                    page.evaluate(f"""() => {{
+                        app.commands.runCommand('dev.perfetto.ExpandTracksByRegex',
+                            {json.dumps(pattern)});
+                    }}""")
+                    time.sleep(0.5)
+                    page.keyboard.press("Escape")
+                    time.sleep(0.3)
+
+                def _scroll_to(target_name):
+                    """Scroll track tree to show the target process/thread."""
+                    _scroll_to_process_area(page, target_name, cat)
+
+                def _annotate(raw_path, final_path, label):
                     img = Image.open(raw_path)
-                    crop_h = _get_pinned_height()
-                    cropped = img.crop((0, 0, 1920, crop_h))
+                    # Crop bottom 25% (Current Selection panel)
+                    crop_h = int(img.height * 0.75)
+                    cropped = img.crop((0, 0, img.width, crop_h))
                     w, h = cropped.size
                     banner_h = 32
                     result = Image.new("RGB", (w, h + banner_h), (13, 17, 23))
                     draw = ImageDraw.Draw(result)
                     draw.rectangle([(0, 0), (w, banner_h)], fill=(22, 27, 34))
                     sev_colors = {"high": (255, 68, 68), "medium": (255, 170, 0)}
-                    draw.rectangle([(0, 0), (5, banner_h)], fill=sev_colors.get(issue.severity, (136,136,136)))
+                    draw.rectangle([(0, 0), (5, banner_h)],
+                        fill=sev_colors.get(issue.severity, (136,136,136)))
                     try:
-                        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 13)
+                        font = ImageFont.truetype(
+                            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 13)
                     except Exception:
                         font = ImageFont.load_default()
-                    desc = issue_desc[:70] if issue_desc else f"Pinned: {', '.join(pin_names)}"
+                    desc = issue_desc[:65] if issue_desc else issue.description
                     draw.text((12, 9),
                         f"[{issue.severity.upper()}] {issue.name} ({label}) | {desc}",
                         fill=(230, 237, 243), font=font)
@@ -1200,17 +1179,30 @@ def capture_screenshots(
                     os.remove(raw_path)
 
                 # Step 5: Take multi-view screenshots
+                # Each view: collapse all → expand target process → scroll → zoom → screenshot
                 shot_files = []
-                for v_idx, (v_label, v_pins, v_start, v_dur) in enumerate(views):
-                    _unpin_all()
-                    _pin(v_pins)
+                for v_idx, (v_label, v_expand, v_start, v_dur, v_scroll) in enumerate(views):
+                    _collapse_all()
+                    _expand(re.escape(v_expand))
+                    _scroll_to(v_expand)
+                    time.sleep(0.3)
+                    # Extra scroll past FrameTimeline bars
+                    page.evaluate(f"""() => {{
+                        const c = document.querySelector(
+                            '.pf-timeline-page__scrolling-track-tree'
+                        ) || document.querySelector('[class*="scrolling-track"]');
+                        if (c) c.scrollTop += {v_scroll};
+                    }}""")
+                    time.sleep(0.3)
                     _zoom(v_start, v_dur)
 
                     shot_name = f"{i:02d}_{issue.name}_{v_idx}.png"
                     raw = str(output_dir / shot_name) + ".raw.png"
-                    _take_and_annotate(raw, str(output_dir / shot_name), v_label, v_pins)
+                    page.screenshot(path=raw,
+                        clip={"x": 0, "y": 0, "width": 1920, "height": 1080})
+                    _annotate(raw, str(output_dir / shot_name), v_label)
                     shot_files.append(shot_name)
-                    print(f"[screenshot]   -> saved {shot_name} ({v_label}, {v_dur/1e6:.0f}ms, {len(v_pins)} tracks)")
+                    print(f"[screenshot]   -> saved {shot_name} ({v_label}, {v_dur/1e6:.0f}ms)")
 
                 screenshot_path = output_dir / shot_files[0]
 
