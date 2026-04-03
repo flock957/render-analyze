@@ -145,29 +145,69 @@ def find_jank_context(port, issue_name, ts, dur, jank_category):
             parts = [f"{s['name'][:40]} ({s.get('dur',0)/1e6:.1f}ms)" for s in slices[:3]]
             context["description"] = f"{label}: " + "; ".join(parts)
 
-    # 2. Find thread states during jank (for all types)
+    # 2. Find Runnable/D-state threads with priority (the CORE diagnostic info)
+    # This is the key metric: "120优先级 monitorAppliedThread runnable 60ms"
+    runnable_threads = _query(port, f"""
+        SELECT t.name AS thread_name, t.tid,
+               ts.state, MAX(ts.dur) / 1000000.0 AS max_dur_ms,
+               SUM(ts.dur) / 1000000.0 AS total_ms,
+               COUNT(*) AS count
+        FROM thread_state ts
+        JOIN thread t ON ts.utid = t.utid
+        WHERE ts.ts >= {ts - 5000000} AND ts.ts + ts.dur <= {ts_end + 5000000}
+        AND ts.state IN ('R', 'R+', 'D', 'DK')
+        AND ts.dur > 1000000
+        GROUP BY t.name, t.tid, ts.state
+        ORDER BY max_dur_ms DESC LIMIT 15
+    """)
+    context["runnable_threads"] = runnable_threads
+
+    # Query thread priorities for the top runnable threads
+    if runnable_threads:
+        tid_list = ",".join(str(int(r.get("tid", 0))) for r in runnable_threads[:10])
+        priorities = _query(port, f"""
+            SELECT tid, MAX(priority) AS priority
+            FROM thread_state ts
+            JOIN thread t ON ts.utid = t.utid
+            WHERE t.tid IN ({tid_list}) AND ts.ts >= {ts} AND ts.ts <= {ts_end}
+            GROUP BY tid
+        """)
+        prio_map = {{int(p.get("tid", 0)): int(p.get("priority", -1)) for p in priorities}}
+
+        # Build description in the format: "120优先级 monitorAppliedThread runnable 60ms"
+        runnable_desc_parts = []
+        for r in runnable_threads[:3]:
+            tid = int(r.get("tid", 0))
+            prio = prio_map.get(tid, -1)
+            state = r.get("state", "?")
+            state_cn = {{"R": "runnable", "R+": "runnable(被抢占)", "D": "D状态(non-io)", "DK": "D状态"}}.get(state, state)
+            prio_str = f"{prio}优先级 " if prio > 0 else ""
+            runnable_desc_parts.append(
+                f"{prio_str}{r['thread_name']} {state_cn} {r['max_dur_ms']:.0f}ms"
+            )
+            # Add to tracks_to_show
+            if r["thread_name"] not in context["tracks_to_show"]:
+                context["tracks_to_show"].append(r["thread_name"])
+
+        if runnable_desc_parts:
+            context["description"] += " | 阻塞原因: " + "; ".join(runnable_desc_parts)
+    else:
+        prio_map = {{}}
+
+    # Also get general thread states for context
     thread_states = _query(port, f"""
         SELECT ts.state, SUM(ts.dur) / 1000000.0 AS total_ms, t.name AS thread_name
         FROM thread_state ts
         JOIN thread t ON ts.utid = t.utid
         WHERE ts.ts >= {ts} AND ts.ts + ts.dur <= {ts_end}
-        AND t.name IN ('surfaceflinger', 'RenderThread', 'main')
+        AND t.name IN ('surfaceflinger', 'RenderThread', 'main',
+                        'RenderEngine', 'HwcAsyncWorker', 'composer')
         GROUP BY ts.state, t.name
         ORDER BY total_ms DESC LIMIT 20
     """)
     context["thread_states"] = thread_states
 
-    # Add thread state info to description
-    blocked_states = [s for s in thread_states
-                      if s.get("state") in ("D", "S") and s.get("total_ms", 0) > 1]
-    if blocked_states:
-        state_desc = "; ".join(
-            f"{s['thread_name']} {s['state']}={s['total_ms']:.1f}ms"
-            for s in blocked_states[:3]
-        )
-        context["description"] += f" | 线程状态: {state_desc}"
-
-    # 3. Find related events (binder, GC, lock)
+    # 3. Find related events (binder, GC, lock, createSurfaceControl)
     related = _query(port, f"""
         SELECT s.ts, s.dur, s.name, t.name AS thread_name
         FROM slice s
@@ -176,13 +216,16 @@ def find_jank_context(port, issue_name, ts, dur, jank_category):
         WHERE s.ts >= {ts} AND s.ts <= {ts_end}
         AND (s.name LIKE 'binder%' OR s.name LIKE 'GC%'
              OR s.name LIKE 'lock%' OR s.name LIKE 'monitor%'
+             OR s.name LIKE 'createSurfaceControl%'
+             OR s.name LIKE 'dequeueBuffer%'
+             OR s.name LIKE 'waiting for presentFence%'
              OR s.name LIKE 'Compiling%' OR s.name LIKE 'JIT%')
         AND s.dur > 1000000
         ORDER BY s.dur DESC LIMIT 5
     """)
     context["related_events"] = related
     if related:
-        rel_desc = "; ".join(f"{r['name'][:30]} ({r.get('dur',0)/1e6:.1f}ms)" for r in related[:2])
+        rel_desc = "; ".join(f"{r['name'][:35]} ({r.get('dur',0)/1e6:.1f}ms)" for r in related[:2])
         context["description"] += f" | 关联: {rel_desc}"
 
     # 4. Find blocking chain: threads that were Runnable/Blocked during jank

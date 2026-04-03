@@ -593,7 +593,14 @@ def generate_html(output_dir: Path, top_n: int = 5) -> str:
     jank_types_data = load_json(output_dir / "jank_types.json")
     app_jank_data = load_json(output_dir / "app_jank.json")
     sf_jank_data = load_json(output_dir / "sf_jank.json")
+    screenshot_targets = load_json(output_dir / "screenshot_targets.json")
     screenshots = load_screenshots(output_dir)
+
+    # Build SQL targets lookup
+    sql_targets = {}
+    if screenshot_targets:
+        for t in screenshot_targets.get("targets", []):
+            sql_targets[t.get("issue_name", "")] = t
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
@@ -799,6 +806,57 @@ footer {{ text-align: center; padding: 32px 0; color: #484f58; font-size: 13px; 
 
             # Screenshot for this issue
             html += screenshot_html(screenshots, issue.get("keywords", [issue["name"]]))
+
+            # SQL-driven diagnostic details (from prepare_screenshot_targets.py)
+            sql_target = sql_targets.get(issue["name"], {})
+            if sql_target:
+                sql_desc = sql_target.get("description", "")
+                runnable_threads = sql_target.get("runnable_threads", [])
+                blocking_chain = sql_target.get("blocking_chain", [])
+
+                html += '<div class="framework-analysis">'
+                html += '<h4>Trace 诊断详情（SQL 查询结果）</h4>'
+
+                if sql_desc:
+                    html += f'<div class="tip"><b>问题定位：</b>{sql_desc}</div>'
+
+                # Runnable/Blocked threads table
+                if runnable_threads:
+                    html += '<h5>关键阻塞线程（Runnable/D-state > 1ms）</h5>'
+                    html += '<table><tr><th>线程</th><th>TID</th><th>状态</th><th>最长阻塞</th><th>累计</th></tr>'
+                    state_cn = {"R": "Runnable(等CPU)", "R+": "Runnable(被抢占)",
+                                "D": "D状态(non-IO)", "DK": "D状态(内核)"}
+                    for r in runnable_threads[:6]:
+                        html += f'<tr><td><code>{r.get("thread_name","?")}</code></td>'
+                        html += f'<td>{r.get("tid","")}</td>'
+                        html += f'<td>{state_cn.get(r.get("state",""), r.get("state",""))}</td>'
+                        html += f'<td><b>{r.get("max_dur_ms",0):.1f}ms</b></td>'
+                        html += f'<td>{r.get("total_ms",0):.1f}ms</td></tr>'
+                    html += '</table>'
+
+                # Key slices
+                slices = sql_target.get("slices", [])
+                if slices:
+                    html += '<h5>关键 Slice（故障时间段内）</h5>'
+                    html += '<table><tr><th>Slice</th><th>线程</th><th>耗时</th></tr>'
+                    for s in slices[:5]:
+                        html += f'<tr><td><code>{s.get("name","?")[:50]}</code></td>'
+                        html += f'<td>{s.get("thread_name","")}</td>'
+                        html += f'<td>{s.get("dur",0)/1e6:.1f}ms</td></tr>'
+                    html += '</table>'
+
+                # Related events
+                related = sql_target.get("related_events", [])
+                if related:
+                    html += '<h5>关联事件（binder/GC/lock/presentFence）</h5>'
+                    html += '<table><tr><th>事件</th><th>线程</th><th>耗时</th></tr>'
+                    for r in related[:4]:
+                        html += f'<tr><td><code>{r.get("name","?")[:45]}</code></td>'
+                        html += f'<td>{r.get("thread_name","")}</td>'
+                        html += f'<td>{r.get("dur",0)/1e6:.1f}ms</td></tr>'
+                    html += '</table>'
+
+                html += '</div>'
 
             # Framework root cause analysis
             html += framework_analysis_html(category)
