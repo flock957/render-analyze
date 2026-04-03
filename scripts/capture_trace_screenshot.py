@@ -1149,8 +1149,15 @@ def capture_screenshots(
                     time.sleep(0.3)
 
                 def _scroll_to(target_name):
-                    """Scroll track tree to show the target process/thread."""
+                    """Scroll to target process. For SF, use search as fallback."""
                     _scroll_to_process_area(page, target_name, cat)
+                    # If target is surfaceflinger and scroll fell back to percentage,
+                    # use search for a known SF slice to navigate vertically
+                    if "surfaceflinger" in target_name.lower():
+                        search_term = "composite" if cat in sf_cats else "onMessageRefresh"
+                        _search_and_navigate(page, search_term)
+                        time.sleep(0.3)
+                        _close_bottom_panel(page)
 
                 def _annotate(raw_path, final_path, label):
                     img = Image.open(raw_path)
