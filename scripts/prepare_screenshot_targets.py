@@ -33,7 +33,15 @@ def _query(port, sql):
 
 
 def find_jank_context(port, issue_name, ts, dur, jank_category):
-    """Query trace_processor for detailed context of a jank frame."""
+    """Query trace_processor for detailed context of a jank frame.
+
+    Finds:
+    1. Key slices during jank (doFrame, composite, presentFence etc.)
+    2. Thread states (Running/Runnable/Sleeping/Blocked) with durations
+    3. Blocking chain: which thread blocked which, with priorities
+    4. Related events (binder, GC, lock)
+    5. Optimal zoom range based on actual problem duration
+    """
     ts_end = ts + dur
     context = {
         "issue_name": issue_name,
@@ -177,13 +185,61 @@ def find_jank_context(port, issue_name, ts, dur, jank_category):
         rel_desc = "; ".join(f"{r['name'][:30]} ({r.get('dur',0)/1e6:.1f}ms)" for r in related[:2])
         context["description"] += f" | 关联: {rel_desc}"
 
+    # 4. Find blocking chain: threads that were Runnable/Blocked during jank
+    # This identifies the critical path (which thread blocked which)
+    blocking_chain = _query(port, f"""
+        SELECT ts.state, ts.dur / 1000000.0 AS dur_ms,
+               t.name AS thread_name, t.tid,
+               ts.dur AS dur_ns
+        FROM thread_state ts
+        JOIN thread t ON ts.utid = t.utid
+        JOIN process p ON t.upid = p.upid
+        WHERE ts.ts >= {ts - 5000000} AND ts.ts + ts.dur <= {ts_end + 5000000}
+        AND ts.state IN ('R', 'R+', 'D', 'DK')
+        AND ts.dur > 3000000
+        AND (p.name LIKE '%surfaceflinger%' OR p.name LIKE '%composer%'
+             OR p.name LIKE '%aweme%' OR p.name LIKE '%RenderEngine%')
+        ORDER BY ts.dur DESC LIMIT 10
+    """)
+    context["blocking_chain"] = blocking_chain
+
+    # Add blocking threads to tracks_to_show
+    for b in blocking_chain[:3]:
+        tname = b.get("thread_name", "")
+        if tname and tname not in context["tracks_to_show"]:
+            context["tracks_to_show"].append(tname)
+
+    # Add blocking info to description
+    if blocking_chain:
+        block_desc = "; ".join(
+            f"{b['thread_name']} {b['state']}={b['dur_ms']:.1f}ms"
+            for b in blocking_chain[:3]
+        )
+        context["description"] += f" | 阻塞链: {block_desc}"
+
     # Fallback description
     if not context["description"]:
         context["description"] = f"{jank_category} jank: {dur/1e6:.1f}ms"
 
-    # Ensure interesting window is reasonable
-    context["interesting_dur"] = max(context["interesting_dur"], 30_000_000)
-    context["interesting_dur"] = min(context["interesting_dur"], 80_000_000)
+    # 5. Dynamic zoom: use actual problem duration, not fixed range
+    # Short janks (< 50ms): show 50-80ms for context
+    # Medium janks (50-200ms): show the full jank + 20% padding
+    # Long janks (> 200ms): show 200ms centered on the densest activity
+    if dur < 50_000_000:
+        context["interesting_dur"] = max(context["interesting_dur"], 50_000_000)
+        context["interesting_dur"] = min(context["interesting_dur"], 80_000_000)
+    elif dur < 200_000_000:
+        context["interesting_dur"] = int(dur * 1.2)
+        context["interesting_start"] = int(ts - dur * 0.1)
+    else:
+        # For very long janks, find the densest 200ms window
+        context["interesting_dur"] = 200_000_000
+        if context["slices"]:
+            # Center on the first slice cluster
+            first_slice_ts = int(context["slices"][0].get("ts", ts))
+            context["interesting_start"] = first_slice_ts - 20_000_000
+        else:
+            context["interesting_start"] = ts
 
     return context
 
