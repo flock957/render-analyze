@@ -991,6 +991,43 @@ def capture_screenshots(
         time.sleep(0.3)
         print("[screenshot] Collapsed FrameTimeline tracks")
 
+        # Expand target processes to discover track names
+        if process_name:
+            page.evaluate(f"""() => {{ app.commands.runCommand(
+                'dev.perfetto.ExpandTracksByRegex', {json.dumps(re.escape(process_name))}); }}""")
+            time.sleep(0.5)
+        page.evaluate("""() => { app.commands.runCommand(
+            'dev.perfetto.ExpandTracksByRegex', 'surfaceflinger'); }""")
+        time.sleep(0.5)
+        page.keyboard.press("Escape")
+        time.sleep(0.5)
+
+        # Find exact track names from DOM
+        track_names = page.evaluate(r"""(() => {
+            const t = [];
+            document.querySelectorAll('*').forEach(el => {
+                const s = el.textContent?.trim() || '';
+                if (s.length > 5 && s.length < 80 && el.children.length < 3 &&
+                    /^\S+\s+\d+$/.test(s)) t.push(s);
+            });
+            return [...new Set(t)];
+        })()""")
+
+        pin_map = {}
+        for t in track_names:
+            name = t.split()[0]
+            if process_name and process_name in name and "main" not in pin_map:
+                pin_map["main"] = t
+            elif name == "RenderThread" and "render" not in pin_map:
+                pin_map["render"] = t
+            elif name == "surfaceflinger" and "sf" not in pin_map:
+                pin_map["sf"] = t
+        print(f"[screenshot] Track map: {pin_map}")
+
+        # Collapse all after discovery
+        page.evaluate("""() => { app.commands.runCommand('dev.perfetto.CollapseTracksByRegex', '.*'); }""")
+        time.sleep(0.5)
+
         # Get trace time bounds
         trace_start_ns = 0
         trace_end_ns = 0
@@ -1028,90 +1065,111 @@ def capture_screenshots(
                 dur = issue.end_ns - issue.start_ns
                 cat = issue.jank_category or "app_deadline"
 
-                # Step 1: Zoom to jank frame using setVisibleWindow
-                target_dur = int(min(max(dur * 1.2, 80_000_000), 150_000_000))
-                vis_start = int(ts - target_dur // 3)
+                # Step 1: Unpin previous tracks
+                page.evaluate("""() => {
+                    document.querySelectorAll('button[title*="Unpin"]').forEach(b => b.click());
+                }""")
+                time.sleep(0.3)
+
+                # Step 2: Pin tracks for this issue type
+                sf_cats = ["display_hal", "sf_cpu", "sf_gpu", "sf_stuffing",
+                           "prediction_error", "sf_scheduling"]
+                pins = []
+                if cat in sf_cats:
+                    if "sf" in pin_map: pins.append(pin_map["sf"])
+                    if "main" in pin_map: pins.append(pin_map["main"])
+                else:
+                    if "main" in pin_map: pins.append(pin_map["main"])
+                    if "render" in pin_map: pins.append(pin_map["render"])
+                if "sf" in pin_map and pin_map["sf"] not in pins:
+                    pins.append(pin_map["sf"])
+
+                for name in pins:
+                    escaped = re.escape(name)
+                    page.evaluate(f"""() => {{ app.commands.runCommand(
+                        'dev.perfetto.PinTracksByRegex', '^{escaped}$'); }}""")
+                    time.sleep(0.2)
+                page.keyboard.press("Escape")
+                time.sleep(0.3)
+                print(f"[screenshot]   Pinned: {pins}")
+
+                # Step 3: Zoom tight (30-80ms for readable slice text)
+                target_dur = int(min(max(dur * 0.3, 30_000_000), 80_000_000))
+                vis_start = int(ts - 5_000_000)  # Start 5ms before jank
                 visible_ms = target_dur / 1e6
 
                 def _apply_zoom():
-                    page.evaluate(f"""
-                        (() => {{
-                            const tl = app.trace.timeline;
-                            const HPT = tl.visibleWindow.start.constructor;
-                            const HPTS = tl.visibleWindow.constructor;
-                            tl.setVisibleWindow(new HPTS(new HPT({vis_start}n), {target_dur}));
-                        }})()
-                    """)
+                    page.evaluate(f"""(() => {{
+                        const tl = app.trace.timeline;
+                        const HPT = tl.visibleWindow.start.constructor;
+                        const HPTS = tl.visibleWindow.constructor;
+                        tl.setVisibleWindow(new HPTS(new HPT({vis_start}n), {target_dur}));
+                    }})()""")
 
                 print(f"[screenshot]   Zooming to: {dur_ms:.1f}ms jank (visible: {visible_ms:.0f}ms)")
                 _apply_zoom()
                 time.sleep(2)
 
-                # Step 2: Always scroll to the APP process area first
-                # (app threads are relevant for all jank types — they show the upstream cause)
-                # Then scroll down to capture SF tracks in subsequent screenshots
-                if process_name:
-                    try:
-                        page.evaluate(f"""
-                            (() => {{ app.commands.runCommand(
-                                'dev.perfetto.ExpandTracksByRegex', {json.dumps(re.escape(process_name))}
-                            ); }})()
-                        """)
-                        time.sleep(0.5)
-                        page.keyboard.press("Escape")
-                        time.sleep(0.3)
-                    except Exception:
-                        pass
-                _scroll_to_process_area(page, process_name, cat)
-                time.sleep(0.5)
+                # Step 4: Get pinned area height and crop to it
+                pinned_h = page.evaluate("""(() => {
+                    const els = document.querySelectorAll('[class*="pinned"], [class*="Pinned"]');
+                    let maxBot = 0;
+                    for (const el of els) {
+                        const r = el.getBoundingClientRect();
+                        if (r.height > 50 && r.top < 500) maxBot = Math.max(maxBot, r.bottom);
+                    }
+                    return maxBot || 500;
+                })()""")
+                crop_h = min(int(pinned_h) + 20, 600)
 
-                # Step 2b: Skip past FrameTimeline bars to thread slices
-                page.evaluate("""
-                    (() => {
-                        const c = document.querySelector(
-                            '.pf-timeline-page__scrolling-track-tree'
-                        ) || document.querySelector('[class*="scrolling-track"]');
-                        if (c) c.scrollTop += 250;
-                    })()
-                """)
-                time.sleep(0.3)
+                # Step 5: Take screenshot at jank START (doFrame/measure/layout)
+                raw1 = str(screenshot_path) + ".raw1.png"
+                page.screenshot(path=raw1, clip={"x": 0, "y": 0, "width": 1920, "height": 1080})
 
-                # Step 3: Re-apply zoom and take MULTIPLE screenshots
-                # (scroll down between each to show different track levels)
-                _apply_zoom()
-                time.sleep(1)
+                # Step 6: Take screenshot at jank END (draw/queueBuffer/composite)
+                vis_start2 = int(ts + dur - target_dur + 5_000_000)
+                page.evaluate(f"""(() => {{
+                    const tl = app.trace.timeline;
+                    const HPT = tl.visibleWindow.start.constructor;
+                    const HPTS = tl.visibleWindow.constructor;
+                    tl.setVisibleWindow(new HPTS(new HPT({vis_start2}n), {target_dur}));
+                }})()""")
+                time.sleep(1.5)
+                raw2 = str(screenshot_path) + ".raw2.png"
+                page.screenshot(path=raw2, clip={"x": 0, "y": 0, "width": 1920, "height": 1080})
 
+                # Step 7: Crop to pinned area + annotate both screenshots
+                from PIL import Image, ImageDraw, ImageFont
                 shot_files = []
-                num_shots = 2  # 2 vertical slices per issue
-                for shot_idx in range(num_shots):
-                    suffix = f"_{shot_idx}" if num_shots > 1 else ""
+                for idx, raw_path in enumerate([raw1, raw2]):
+                    img = Image.open(raw_path)
+                    cropped = img.crop((0, 0, 1920, crop_h))
+                    w, h = cropped.size
+
+                    banner_h = 32
+                    result = Image.new("RGB", (w, h + banner_h), (13, 17, 23))
+                    draw = ImageDraw.Draw(result)
+                    draw.rectangle([(0, 0), (w, banner_h)], fill=(22, 27, 34))
+                    sev_colors = {"high": (255, 68, 68), "medium": (255, 170, 0)}
+                    sev_color = sev_colors.get(issue.severity, (136, 136, 136))
+                    draw.rectangle([(0, 0), (5, banner_h)], fill=sev_color)
+                    try:
+                        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 13)
+                    except Exception:
+                        font = ImageFont.load_default()
+                    label = "start" if idx == 0 else "end"
+                    draw.text((12, 9),
+                        f"[{issue.severity.upper()}] {issue.name} - {dur_ms:.1f}ms ({label}) | Pinned: {', '.join(pins)}",
+                        fill=(230, 237, 243), font=font)
+                    result.paste(cropped, (0, banner_h))
+
+                    suffix = f"_{idx}" if True else ""
                     shot_name = f"{i:02d}_{issue.name}{suffix}.png"
-                    raw_path = str(output_dir / shot_name) + ".raw.png"
-                    final_path = str(output_dir / shot_name)
-
-                    page.screenshot(
-                        path=raw_path,
-                        clip={"x": 0, "y": 0, "width": 1920, "height": 1080},
-                    )
-                    _annotate_screenshot(raw_path, final_path, issue)
+                    result.save(str(output_dir / shot_name), quality=95)
                     shot_files.append(shot_name)
-                    print(f"[screenshot]   -> saved {shot_name}")
+                    os.remove(raw_path)
+                    print(f"[screenshot]   -> saved {shot_name} (cropped to {w}x{h + banner_h})")
 
-                    # Scroll down for next vertical slice
-                    if shot_idx < num_shots - 1:
-                        page.evaluate("""
-                            (() => {
-                                const c = document.querySelector(
-                                    '.pf-timeline-page__scrolling-track-tree'
-                                ) || document.querySelector('[class*="scrolling-track"]');
-                                if (c) c.scrollTop += 350;
-                            })()
-                        """)
-                        time.sleep(0.5)
-                        _apply_zoom()
-                        time.sleep(0.5)
-
-                # Use first shot as the main screenshot for the manifest
                 screenshot_path = output_dir / shot_files[0]
 
                 results.append(ScreenshotResult(
