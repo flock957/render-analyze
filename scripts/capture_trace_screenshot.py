@@ -1028,6 +1028,18 @@ def capture_screenshots(
         page.evaluate("""() => { app.commands.runCommand('dev.perfetto.CollapseTracksByRegex', '.*'); }""")
         time.sleep(0.5)
 
+        # Load screenshot targets (from prepare_screenshot_targets.py)
+        targets_file = Path(str(output_dir).replace("/screenshots", "")) / "screenshot_targets.json"
+        targets_data = {}
+        if targets_file.exists():
+            try:
+                td = json.loads(targets_file.read_text())
+                for t in td.get("targets", []):
+                    targets_data[t["issue_name"]] = t
+                print(f"[screenshot] Loaded {len(targets_data)} screenshot targets")
+            except Exception:
+                pass
+
         # Get trace time bounds
         trace_start_ns = 0
         trace_end_ns = 0
@@ -1093,9 +1105,17 @@ def capture_screenshots(
                 time.sleep(0.3)
                 print(f"[screenshot]   Pinned: {pins}")
 
-                # Step 3: Zoom tight (30-80ms for readable slice text)
-                target_dur = int(min(max(dur * 0.3, 30_000_000), 80_000_000))
-                vis_start = int(ts - 5_000_000)  # Start 5ms before jank
+                # Step 3: Zoom using precise targets from trace_processor (if available)
+                target = targets_data.get(issue.name, {})
+                if target.get("interesting_start") and target.get("interesting_dur"):
+                    vis_start = int(target["interesting_start"])
+                    target_dur = int(target["interesting_dur"])
+                    issue_desc = target.get("description", "")
+                    print(f"[screenshot]   Using SQL target: {issue_desc[:60]}")
+                else:
+                    target_dur = int(min(max(dur * 0.3, 30_000_000), 80_000_000))
+                    vis_start = int(ts - 5_000_000)
+                    issue_desc = ""
                 visible_ms = target_dur / 1e6
 
                 def _apply_zoom():
@@ -1158,8 +1178,10 @@ def capture_screenshots(
                     except Exception:
                         font = ImageFont.load_default()
                     label = "start" if idx == 0 else "end"
+                    # Use SQL-derived description if available
+                    desc_text = issue_desc if issue_desc else f"Pinned: {', '.join(pins)}"
                     draw.text((12, 9),
-                        f"[{issue.severity.upper()}] {issue.name} - {dur_ms:.1f}ms ({label}) | Pinned: {', '.join(pins)}",
+                        f"[{issue.severity.upper()}] {issue.name} - {dur_ms:.1f}ms ({label}) | {desc_text[:80]}",
                         fill=(230, 237, 243), font=font)
                     result.paste(cropped, (0, banner_h))
 

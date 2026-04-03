@@ -174,6 +174,15 @@ def main():
     else:
         print("\n[SKIP] Phase 6: No SF-level jank types detected")
 
+    # ── Phase 6.5: Prepare Screenshot Targets ──
+    # Query trace_processor for precise per-issue context BEFORE stopping it
+    if not args.skip_screenshot:
+        _run([python, str(SCRIPT_DIR / "prepare_screenshot_targets.py"),
+              "--port", str(port),
+              "--output-dir", str(output_dir),
+              "--top-n", str(args.top_n)],
+             "Phase 6.5: Prepare Screenshot Targets", check=False)
+
     # ── Phase 7: Screenshots (Optional) ──
     if not args.skip_screenshot:
         screenshot_cmd = [
