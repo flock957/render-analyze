@@ -1083,114 +1083,134 @@ def capture_screenshots(
                 }""")
                 time.sleep(0.3)
 
-                # Step 2: Pin tracks for this issue type
+                # Step 2: Load SQL targets for this issue
+                target = targets_data.get(issue.name, {})
+                issue_desc = target.get("description", "")
+                if issue_desc:
+                    print(f"[screenshot]   SQL: {issue_desc[:70]}")
+
+                # Step 3: Define multi-view screenshot plan
+                # Each view = (label, pin_tracks, zoom_start, zoom_dur)
                 sf_cats = ["display_hal", "sf_cpu", "sf_gpu", "sf_stuffing",
                            "prediction_error", "sf_scheduling"]
-                pins = []
-                if cat in sf_cats:
-                    if "sf" in pin_map: pins.append(pin_map["sf"])
-                    if "main" in pin_map: pins.append(pin_map["main"])
-                else:
-                    if "main" in pin_map: pins.append(pin_map["main"])
-                    if "render" in pin_map: pins.append(pin_map["render"])
-                if "sf" in pin_map and pin_map["sf"] not in pins:
-                    pins.append(pin_map["sf"])
 
-                for name in pins:
-                    escaped = re.escape(name)
-                    page.evaluate(f"""() => {{ app.commands.runCommand(
-                        'dev.perfetto.PinTracksByRegex', '^{escaped}$'); }}""")
-                    time.sleep(0.2)
-                page.keyboard.press("Escape")
-                time.sleep(0.3)
-                print(f"[screenshot]   Pinned: {pins}")
-
-                # Step 3: Zoom using precise targets from trace_processor (if available)
-                target = targets_data.get(issue.name, {})
+                # Get zoom parameters from SQL target or defaults
                 if target.get("interesting_start") and target.get("interesting_dur"):
-                    vis_start = int(target["interesting_start"])
-                    target_dur = int(target["interesting_dur"])
-                    issue_desc = target.get("description", "")
-                    print(f"[screenshot]   Using SQL target: {issue_desc[:60]}")
+                    t_start = int(target["interesting_start"])
+                    t_dur = int(target["interesting_dur"])
                 else:
-                    target_dur = int(min(max(dur * 0.3, 30_000_000), 80_000_000))
-                    vis_start = int(ts - 5_000_000)
-                    issue_desc = ""
-                visible_ms = target_dur / 1e6
+                    t_dur = int(min(max(dur * 1.2, 50_000_000), 200_000_000))
+                    t_start = int(ts - t_dur * 0.1)
 
-                def _apply_zoom():
+                views = []
+
+                # View 1: App pipeline (main + RenderThread + SF)
+                app_pins = []
+                if "main" in pin_map: app_pins.append(pin_map["main"])
+                if "render" in pin_map: app_pins.append(pin_map["render"])
+                if "sf" in pin_map: app_pins.append(pin_map["sf"])
+                if app_pins:
+                    views.append(("App渲染管线", app_pins, t_start, t_dur))
+
+                # View 2: SF detail (SF only, tighter zoom for slice readability)
+                if "sf" in pin_map:
+                    sf_dur = min(t_dur, 60_000_000)  # Max 60ms for SF detail
+                    sf_start = t_start + (t_dur - sf_dur) // 2  # Center
+                    views.append(("SF合成细节", [pin_map["sf"]], sf_start, sf_dur))
+
+                # View 3: Blocking chain (from SQL analysis)
+                blocking = target.get("blocking_chain", [])
+                if blocking:
+                    block_pins = []
+                    for b in blocking[:2]:
+                        tname = f"{b['thread_name']} {b['tid']}"
+                        # Check if this track exists in discovered tracks
+                        for tn in track_names:
+                            if b['thread_name'] in tn:
+                                block_pins.append(tn)
+                                break
+                    if "sf" in pin_map and pin_map["sf"] not in block_pins:
+                        block_pins.insert(0, pin_map["sf"])
+                    if block_pins:
+                        views.append(("阻塞链", block_pins, t_start, t_dur))
+
+                print(f"[screenshot]   Views: {[v[0] for v in views]}")
+
+                # Step 4: Helper functions
+                from PIL import Image, ImageDraw, ImageFont
+
+                def _unpin_all():
+                    page.evaluate("""() => {
+                        document.querySelectorAll('button[title*="Unpin"]').forEach(b => b.click());
+                    }""")
+                    time.sleep(0.3)
+
+                def _pin(track_list):
+                    for name in track_list:
+                        escaped = re.escape(name)
+                        page.evaluate(f"""() => {{ app.commands.runCommand(
+                            'dev.perfetto.PinTracksByRegex', '^{escaped}$'); }}""")
+                        time.sleep(0.2)
+                    page.keyboard.press("Escape")
+                    time.sleep(0.3)
+
+                def _zoom(start, duration):
                     page.evaluate(f"""(() => {{
                         const tl = app.trace.timeline;
                         const HPT = tl.visibleWindow.start.constructor;
                         const HPTS = tl.visibleWindow.constructor;
-                        tl.setVisibleWindow(new HPTS(new HPT({vis_start}n), {target_dur}));
+                        tl.setVisibleWindow(new HPTS(new HPT({start}n), {duration}));
                     }})()""")
+                    time.sleep(1.5)
 
-                print(f"[screenshot]   Zooming to: {dur_ms:.1f}ms jank (visible: {visible_ms:.0f}ms)")
-                _apply_zoom()
-                time.sleep(2)
+                def _get_pinned_height():
+                    h = page.evaluate("""(() => {
+                        const els = document.querySelectorAll('[class*="pinned"], [class*="Pinned"]');
+                        let m = 0;
+                        for (const e of els) {
+                            const r = e.getBoundingClientRect();
+                            if (r.height > 50 && r.top < 600) m = Math.max(m, r.bottom);
+                        }
+                        return m || 500;
+                    })()""")
+                    return min(int(h) + 20, 650)
 
-                # Step 4: Get pinned area height and crop to it
-                pinned_h = page.evaluate("""(() => {
-                    const els = document.querySelectorAll('[class*="pinned"], [class*="Pinned"]');
-                    let maxBot = 0;
-                    for (const el of els) {
-                        const r = el.getBoundingClientRect();
-                        if (r.height > 50 && r.top < 500) maxBot = Math.max(maxBot, r.bottom);
-                    }
-                    return maxBot || 500;
-                })()""")
-                crop_h = min(int(pinned_h) + 20, 600)
-
-                # Step 5: Take screenshot at jank START (doFrame/measure/layout)
-                raw1 = str(screenshot_path) + ".raw1.png"
-                page.screenshot(path=raw1, clip={"x": 0, "y": 0, "width": 1920, "height": 1080})
-
-                # Step 6: Take screenshot at jank END (draw/queueBuffer/composite)
-                vis_start2 = int(ts + dur - target_dur + 5_000_000)
-                page.evaluate(f"""(() => {{
-                    const tl = app.trace.timeline;
-                    const HPT = tl.visibleWindow.start.constructor;
-                    const HPTS = tl.visibleWindow.constructor;
-                    tl.setVisibleWindow(new HPTS(new HPT({vis_start2}n), {target_dur}));
-                }})()""")
-                time.sleep(1.5)
-                raw2 = str(screenshot_path) + ".raw2.png"
-                page.screenshot(path=raw2, clip={"x": 0, "y": 0, "width": 1920, "height": 1080})
-
-                # Step 7: Crop to pinned area + annotate both screenshots
-                from PIL import Image, ImageDraw, ImageFont
-                shot_files = []
-                for idx, raw_path in enumerate([raw1, raw2]):
+                def _take_and_annotate(raw_path, final_path, label, pin_names):
+                    page.screenshot(path=raw_path, clip={"x": 0, "y": 0, "width": 1920, "height": 1080})
                     img = Image.open(raw_path)
+                    crop_h = _get_pinned_height()
                     cropped = img.crop((0, 0, 1920, crop_h))
                     w, h = cropped.size
-
                     banner_h = 32
                     result = Image.new("RGB", (w, h + banner_h), (13, 17, 23))
                     draw = ImageDraw.Draw(result)
                     draw.rectangle([(0, 0), (w, banner_h)], fill=(22, 27, 34))
                     sev_colors = {"high": (255, 68, 68), "medium": (255, 170, 0)}
-                    sev_color = sev_colors.get(issue.severity, (136, 136, 136))
-                    draw.rectangle([(0, 0), (5, banner_h)], fill=sev_color)
+                    draw.rectangle([(0, 0), (5, banner_h)], fill=sev_colors.get(issue.severity, (136,136,136)))
                     try:
                         font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 13)
                     except Exception:
                         font = ImageFont.load_default()
-                    label = "start" if idx == 0 else "end"
-                    # Use SQL-derived description if available
-                    desc_text = issue_desc if issue_desc else f"Pinned: {', '.join(pins)}"
+                    desc = issue_desc[:70] if issue_desc else f"Pinned: {', '.join(pin_names)}"
                     draw.text((12, 9),
-                        f"[{issue.severity.upper()}] {issue.name} - {dur_ms:.1f}ms ({label}) | {desc_text[:80]}",
+                        f"[{issue.severity.upper()}] {issue.name} ({label}) | {desc}",
                         fill=(230, 237, 243), font=font)
                     result.paste(cropped, (0, banner_h))
-
-                    suffix = f"_{idx}" if True else ""
-                    shot_name = f"{i:02d}_{issue.name}{suffix}.png"
-                    result.save(str(output_dir / shot_name), quality=95)
-                    shot_files.append(shot_name)
+                    result.save(final_path, quality=95)
                     os.remove(raw_path)
-                    print(f"[screenshot]   -> saved {shot_name} (cropped to {w}x{h + banner_h})")
+
+                # Step 5: Take multi-view screenshots
+                shot_files = []
+                for v_idx, (v_label, v_pins, v_start, v_dur) in enumerate(views):
+                    _unpin_all()
+                    _pin(v_pins)
+                    _zoom(v_start, v_dur)
+
+                    shot_name = f"{i:02d}_{issue.name}_{v_idx}.png"
+                    raw = str(output_dir / shot_name) + ".raw.png"
+                    _take_and_annotate(raw, str(output_dir / shot_name), v_label, v_pins)
+                    shot_files.append(shot_name)
+                    print(f"[screenshot]   -> saved {shot_name} ({v_label}, {v_dur/1e6:.0f}ms, {len(v_pins)} tracks)")
 
                 screenshot_path = output_dir / shot_files[0]
 
