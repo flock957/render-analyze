@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """Phase 2: Capture Perfetto UI screenshots for top jank issues.
 
-Optimized for maximum information density:
-- Tall viewport (1920x2400) for long screenshots showing more pinned tracks
-- Pins full rendering pipeline: Timeline → App → SF → HWC → CrtcCommit
-- CSS hides non-pinned content to eliminate whitespace
-- Two screenshot types:
-  - Overview: wider zoom (~500ms context) for jank pattern recognition
-  - Detail: tight zoom for slice-level readability
+v4: Uses trace_processor HTTP RPC for fast loading.
+- Starts trace_processor --httpd in background (loads trace once)
+- Perfetto UI connects via RPC, no file upload, no in-browser parsing
+- Tall viewport (1920x2400) for long screenshots
+- Full rendering pipeline pin: Timeline → App → SF → HWC → CrtcCommit
+- Auto-crop screenshots to pinned content area
+- DOM-based wait (not fixed sleep) for trace ready state
 
-Uses Perfetto APIs:
-- Commands: app.commands.runCommand('dev.perfetto.XXX', arg)
-- Zoom:     app._activeTrace.timeline.setVisibleWindow(HPT, dur)
-- Sidebar:  dev.perfetto.ToggleLeftSidebar
+Two screenshot types per jank:
+- Overview: ±500ms context for pattern recognition
+- Detail: tight zoom for slice text readability
 """
 import argparse
 import json
+import os
+import subprocess
 import time
 import sys
 from pathlib import Path
@@ -24,6 +25,10 @@ from pathlib import Path
 # Viewport dimensions — tall to show many pinned tracks
 VIEWPORT_WIDTH = 1920
 VIEWPORT_HEIGHT = 2400
+
+# trace_processor binary for HTTP RPC mode
+TRACE_PROCESSOR_BIN = "/home/wq/workspace/test_render_traces/trace_processor"
+TRACE_PROCESSOR_PORT = 9001
 
 
 def main():
@@ -58,117 +63,166 @@ def main():
 
     results = []
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=['--no-sandbox'])
-        page = browser.new_page(viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT})
+    # --- Start trace_processor HTTP RPC server (loads trace ONCE) ---
+    size_mb = trace.stat().st_size // 1024 // 1024
+    print(f"  [2.0] Starting trace_processor HTTP RPC for {size_mb}MB trace...")
+    tp_proc = _start_trace_processor(trace)
 
-        # --- Load Perfetto UI ---
-        print("  [2.1] Loading Perfetto UI...")
-        page.goto("https://ui.perfetto.dev")
-        page.wait_for_load_state("networkidle")
-        time.sleep(3)
-        _dismiss_cookie(page)
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=['--no-sandbox'])
+            page = browser.new_page(viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT})
 
-        # --- Load trace ---
-        size_mb = trace.stat().st_size // 1024 // 1024
-        print(f"  [2.2] Loading trace ({size_mb}MB)...")
-        with page.expect_file_chooser() as fc:
-            page.click("text=Open trace file")
-        fc.value.set_files(str(trace))
+            # --- Load Perfetto UI (will auto-detect RPC server) ---
+            print("  [2.1] Loading Perfetto UI...")
+            page.goto("https://ui.perfetto.dev")
+            page.wait_for_load_state("networkidle")
+            time.sleep(2)
+            _dismiss_cookie(page)
 
-        # Scale wait time with trace size
-        wait_s = max(20, min(60, size_mb // 2))
-        print(f"         Waiting {wait_s}s for render...")
-        time.sleep(wait_s)
-        _dismiss_cookie(page)
+            # --- Load trace (try RPC first, fallback to file upload) ---
+            print("  [2.2] Loading trace...")
+            t0 = time.time()
+            rpc_used = False
 
-        # --- Prepare UI ---
-        print("  [2.3] Preparing UI (sidebar, expand, discover tracks)...")
-        # Hide sidebar for maximum trace area
-        sidebar_visible = page.evaluate("""
-            (() => {
-                const sb = document.querySelector('.pf-sidebar');
-                return sb && sb.offsetWidth > 50;
-            })()
-        """)
-        if sidebar_visible:
-            _cmd(page, 'dev.perfetto.ToggleLeftSidebar')
+            if tp_proc is not None:
+                # Wait briefly for Perfetto UI to auto-detect RPC server
+                # When detected, it may either:
+                # 1. Show "YES, use loaded trace" dialog
+                # 2. Auto-load the trace silently
+                time.sleep(3)
+
+                # Try to click YES dialog if present
+                try:
+                    btn = page.locator("button:has-text('YES'), text='YES, use loaded trace'").first
+                    if btn.is_visible(timeout=2000):
+                        btn.click()
+                        print(f"         RPC dialog accepted")
+                        rpc_used = True
+                except: pass
+
+                # Check if trace is already loaded via RPC (no dialog needed)
+                if not rpc_used:
+                    try:
+                        loaded = page.evaluate(
+                            "() => !!(window.app && window.app._activeTrace && window.app._activeTrace.timeline)"
+                        )
+                        if loaded:
+                            print(f"         RPC auto-loaded (no dialog)")
+                            rpc_used = True
+                    except: pass
+
+            if not rpc_used:
+                # Fall back to file upload
+                print("         Using file upload...")
+                try:
+                    with page.expect_file_chooser(timeout=5000) as fc:
+                        page.click("text=Open trace file")
+                    fc.value.set_files(str(trace))
+                except Exception as e:
+                    print(f"         File upload failed: {e}")
+                    raise
+
+            # --- Wait for trace to be fully loaded (DOM-based, not sleep) ---
+            print("  [2.2.1] Waiting for trace to be ready...")
+            try:
+                page.wait_for_function(
+                    "() => window.app && window.app._activeTrace && window.app._activeTrace.timeline",
+                    timeout=120000,
+                )
+                print(f"         Trace ready in {time.time()-t0:.1f}s ({'RPC' if rpc_used else 'file upload'})")
+            except Exception as e:
+                print(f"         Wait timeout: {e}")
+            time.sleep(2)  # small grace period for UI render
+            _dismiss_cookie(page)
+
+            # --- Prepare UI ---
+            print("  [2.3] Preparing UI (sidebar, expand, discover tracks)...")
+            # Hide sidebar for maximum trace area
+            sidebar_visible = page.evaluate("""
+                (() => {
+                    const sb = document.querySelector('.pf-sidebar');
+                    return sb && sb.offsetWidth > 50;
+                })()
+            """)
+            if sidebar_visible:
+                _cmd(page, 'dev.perfetto.ToggleLeftSidebar')
+                time.sleep(0.5)
+
+            # Expand all to make tracks discoverable, then collapse
+            _cmd(page, 'dev.perfetto.ExpandAllGroups')
+            time.sleep(2)
+            _cmd(page, 'dev.perfetto.CollapseAllGroups')
             time.sleep(0.5)
 
-        # Expand all to make tracks discoverable, then collapse
-        _cmd(page, 'dev.perfetto.ExpandAllGroups')
-        time.sleep(2)
-        _cmd(page, 'dev.perfetto.CollapseAllGroups')
-        time.sleep(0.5)
+            # --- Process each jank frame ---
+            for i, frame in enumerate(top_frames):
+                jank_type = frame["jank_type"]
+                dur_ms = frame["actual_dur_ms"]
+                ts = frame["ts"]
+                dur = frame["dur"]
+                safe_name = jank_type.replace(",", "").replace(" ", "_")[:40]
 
-        # --- Process each jank frame ---
-        for i, frame in enumerate(top_frames):
-            jank_type = frame["jank_type"]
-            dur_ms = frame["actual_dur_ms"]
-            ts = frame["ts"]
-            dur = frame["dur"]
-            safe_name = jank_type.replace(",", "").replace(" ", "_")[:40]
+                print(f"\n  [2.4.{i+1}] [{i+1}/{len(top_frames)}] {jank_type} ({dur_ms:.1f}ms)")
 
-            print(f"\n  [2.4.{i+1}] [{i+1}/{len(top_frames)}] {jank_type} ({dur_ms:.1f}ms)")
+                # Reset: unpin, collapse, close drawer, clear search
+                _cmd(page, 'dev.perfetto.UnpinAllTracks')
+                _cmd(page, 'dev.perfetto.CollapseAllGroups')
+                _close_drawer(page)
+                _clear_search(page)
+                time.sleep(0.3)
 
-            # Reset: unpin, collapse, close drawer, clear search
-            _cmd(page, 'dev.perfetto.UnpinAllTracks')
-            _cmd(page, 'dev.perfetto.CollapseAllGroups')
-            _close_drawer(page)
-            _clear_search(page)
-            time.sleep(0.3)
+                # Expand target process + SF groups so their children are pinnable
+                _cmd(page, 'dev.perfetto.ExpandTracksByRegex', target['process_name'])
+                time.sleep(0.3)
+                _cmd(page, 'dev.perfetto.ExpandTracksByRegex', 'surfaceflinger')
+                time.sleep(0.3)
 
-            # Expand target process + SF groups so their children are pinnable
-            _cmd(page, 'dev.perfetto.ExpandTracksByRegex', target['process_name'])
-            time.sleep(0.3)
-            _cmd(page, 'dev.perfetto.ExpandTracksByRegex', 'surfaceflinger')
-            time.sleep(0.3)
+                # Pin all rendering pipeline tracks (order matters for top-to-bottom layout)
+                for pat in pin_patterns:
+                    _cmd(page, 'dev.perfetto.PinTracksByRegex', pat)
+                    time.sleep(0.2)
 
-            # Pin all rendering pipeline tracks (order matters for top-to-bottom layout)
-            for pat in pin_patterns:
-                _cmd(page, 'dev.perfetto.PinTracksByRegex', pat)
-                time.sleep(0.2)
+                # Collapse all non-pinned tracks (pinned stay at top)
+                _cmd(page, 'dev.perfetto.CollapseAllGroups')
+                time.sleep(0.3)
 
-            # Collapse all non-pinned tracks (pinned stay at top)
-            _cmd(page, 'dev.perfetto.CollapseAllGroups')
-            time.sleep(0.3)
+                # === Overview screenshot ===
+                overview_pad = max(int(dur * 3), 500_000_000)  # min 500ms total context
+                _zoom_to(page, ts - overview_pad, ts + dur + overview_pad)
+                time.sleep(1.5)
+                _dismiss_cookie(page)
+                _close_drawer(page)
+                _hide_nonpinned_tracks(page)
 
-            # === Overview screenshot ===
-            # Wider context: ~500ms around the jank frame for pattern recognition
-            overview_pad = max(int(dur * 3), 500_000_000)  # min 500ms total context
-            _zoom_to(page, ts - overview_pad, ts + dur + overview_pad)
-            time.sleep(1.5)
-            _dismiss_cookie(page)
-            _close_drawer(page)
-            _hide_nonpinned_tracks(page)
+                overview_file = f"{i:02d}_{safe_name}_overview.png"
+                _take_screenshot(page, output / overview_file)
+                print(f"         -> {overview_file}")
 
-            overview_file = f"{i:02d}_{safe_name}_overview.png"
-            _take_screenshot(page, output / overview_file)
-            print(f"         -> {overview_file}")
+                # === Detail screenshot: tight zoom for slice readability ===
+                detail_window = max(int(dur * 0.5), 50_000_000)
+                _zoom_to(page, ts - detail_window, ts + dur + detail_window)
+                time.sleep(1.0)
+                _dismiss_cookie(page)
+                _close_drawer(page)
+                _hide_nonpinned_tracks(page)
 
-            # === Detail screenshot: tight zoom for slice readability ===
-            # Zoom tight enough that slice text is readable (~100-200ms window)
-            detail_window = max(int(dur * 0.5), 50_000_000)  # min 50ms padding
-            _zoom_to(page, ts - detail_window, ts + dur + detail_window)
-            time.sleep(1.0)
-            _dismiss_cookie(page)
-            _close_drawer(page)
-            _hide_nonpinned_tracks(page)
+                detail_file = f"{i:02d}_{safe_name}_detail.png"
+                _take_screenshot(page, output / detail_file)
+                print(f"         -> {detail_file}")
 
-            detail_file = f"{i:02d}_{safe_name}_detail.png"
-            _take_screenshot(page, output / detail_file)
-            print(f"         -> {detail_file}")
+                results.append({
+                    "name": jank_type,
+                    "overview": overview_file,
+                    "detail": detail_file,
+                    "dur_ms": dur_ms,
+                    "ts": ts,
+                    "success": True,
+                })
 
-            results.append({
-                "name": jank_type,
-                "overview": overview_file,
-                "detail": detail_file,
-                "dur_ms": dur_ms,
-                "ts": ts,
-                "success": True,
-            })
-
-        browser.close()
+            browser.close()
+    finally:
+        _stop_trace_processor(tp_proc)
 
     # Write manifest
     manifest = {
@@ -183,6 +237,67 @@ def main():
     _write(output / "screenshot_manifest.json", manifest)
 
     print(f"\n[Phase 2] Complete: {len(results)} issues -> {output}/")
+
+
+# ─── trace_processor HTTP RPC management ──────────────────────────────
+
+def _start_trace_processor(trace_path):
+    """Start trace_processor in HTTP RPC mode and wait for it to be ready."""
+    if not Path(TRACE_PROCESSOR_BIN).exists():
+        print(f"         WARNING: trace_processor not found at {TRACE_PROCESSOR_BIN}")
+        print(f"         Falling back to file upload mode")
+        return None
+
+    # Kill any existing instance on the port
+    try:
+        subprocess.run(["pkill", "-f", "trace_processor.*--httpd"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.5)
+    except: pass
+
+    # Start trace_processor with HTTP RPC
+    proc = subprocess.Popen(
+        [TRACE_PROCESSOR_BIN, "-D", str(trace_path)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+    # Wait for HTTP server to be ready (poll /status)
+    import socket
+    t0 = time.time()
+    while time.time() - t0 < 60:
+        try:
+            with socket.create_connection(("127.0.0.1", TRACE_PROCESSOR_PORT), timeout=1):
+                # Server is up, but trace might still be loading
+                # Wait for it to actually respond to status
+                import urllib.request
+                req = urllib.request.Request(f"http://127.0.0.1:{TRACE_PROCESSOR_PORT}/status")
+                try:
+                    with urllib.request.urlopen(req, timeout=2) as resp:
+                        if resp.status == 200:
+                            elapsed = time.time() - t0
+                            print(f"         trace_processor ready in {elapsed:.1f}s")
+                            return proc
+                except: pass
+        except: pass
+        time.sleep(0.5)
+
+    print(f"         WARNING: trace_processor RPC not ready after 60s")
+    return proc
+
+
+def _stop_trace_processor(proc):
+    """Stop the trace_processor RPC server."""
+    if proc is None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except: pass
+    try:
+        subprocess.run(["pkill", "-f", "trace_processor.*--httpd"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except: pass
 
 
 # ─── Perfetto interaction helpers ─────────────────────────────────────
