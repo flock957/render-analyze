@@ -246,8 +246,14 @@ def main():
     """)
     crtc_threads = [{"name": r.name, "tid": r.tid} for r in q_crtc]
 
-    # Build pin patterns for the full rendering pipeline
+    # Build pin patterns for the full rendering pipeline (flat list, legacy)
     pin_patterns = _build_pin_patterns(
+        target, app_main, app_render, sf_main_tid, sf_pid,
+        sf_render_engine, sf_gpu, sf_binder, hwc_threads, crtc_threads
+    )
+
+    # Build grouped pin patterns for multi-screenshot capture
+    pin_groups = _build_pin_groups(
         target, app_main, app_render, sf_main_tid, sf_pid,
         sf_render_engine, sf_gpu, sf_binder, hwc_threads, crtc_threads
     )
@@ -265,6 +271,7 @@ def main():
         "hwc_threads": hwc_threads,
         "crtc_threads": crtc_threads,
         "pin_patterns": pin_patterns,
+        "pin_groups": pin_groups,
     }
     _write(output / "thread_map.json", thread_map)
 
@@ -280,6 +287,55 @@ def main():
 
     tp.close()
     print(f"\n[Phase 1] Complete -> {output}/")
+
+
+def _build_pin_groups(target, app_main, app_render, sf_main_tid, sf_pid,
+                      sf_render_engine, sf_gpu, sf_binder, hwc_threads, crtc_threads):
+    """Build pin patterns grouped by logical layer for multi-screenshot capture.
+
+    Each group fits comfortably in one viewport (~5 tracks max).
+    Groups represent different layers of the rendering pipeline.
+    """
+    # Group 1: Frame Timeline + App layer (UI thread perspective)
+    group_app = {
+        "name": "app",
+        "label": "App + Frame Timeline",
+        "patterns": [],
+    }
+    group_app["patterns"].append("Expected Timeline")
+    group_app["patterns"].append("Actual Timeline")
+    if app_main:
+        group_app["patterns"].append(f"{app_main[0]['name']} {app_main[0]['tid']}")
+    if app_render:
+        group_app["patterns"].append(f"RenderThread {app_render[0]['tid']}")
+
+    # Group 2: SurfaceFlinger layer (compositor perspective)
+    group_sf = {
+        "name": "sf",
+        "label": "SurfaceFlinger Pipeline",
+        "patterns": [],
+    }
+    if sf_main_tid:
+        group_sf["patterns"].append(f"surfaceflinger {sf_main_tid}")
+    if sf_render_engine:
+        group_sf["patterns"].append(f"RenderEngine {sf_render_engine[0]['tid']}")
+    if sf_gpu:
+        group_sf["patterns"].append(f"GPU completion {sf_gpu[0]['tid']}")
+    if sf_binder:
+        group_sf["patterns"].append(f"{sf_binder[0]['name']}")
+
+    # Group 3: Display HAL layer (HWC + kernel)
+    group_hal = {
+        "name": "hal",
+        "label": "Display HAL + Kernel",
+        "patterns": [],
+    }
+    for t in hwc_threads[:2]:
+        group_hal["patterns"].append(f"{t['name']}")
+    for t in crtc_threads[:2]:
+        group_hal["patterns"].append(f"{t['name']}")
+
+    return [group_app, group_sf, group_hal]
 
 
 def _build_pin_patterns(target, app_main, app_render, sf_main_tid, sf_pid,

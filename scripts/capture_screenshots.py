@@ -50,10 +50,12 @@ def main():
 
     top_frames = app_jank["top_frames"][:5]
     pin_patterns = thread_map["pin_patterns"]
+    pin_groups = thread_map.get("pin_groups", [])
 
-    print(f"[Phase 2] Capturing screenshots for {len(top_frames)} issues")
+    print(f"[Phase 2] Capturing screenshots for {len(top_frames)} issues × {len(pin_groups)} groups")
     print(f"  Target: {target['process_name']} pid={target['pid']}")
-    print(f"  Pin patterns ({len(pin_patterns)}): {pin_patterns}")
+    for g in pin_groups:
+        print(f"  Group [{g['name']}] {g['label']}: {g['patterns']}")
 
     try:
         from playwright.sync_api import sync_playwright
@@ -155,70 +157,81 @@ def main():
             _cmd(page, 'dev.perfetto.CollapseAllGroups')
             time.sleep(0.5)
 
-            # --- Process each jank frame ---
+            # === GROUPED CAPTURE LOOP ===
+            # Outer loop: track groups (pin once per group, reuse for all frames)
+            # Inner loop: jank frames (just zoom + screenshot)
+            #
+            # For each frame, we produce:
+            #   - {i}_{name}_overview.png — wide context, group=app
+            #   - {i}_{name}_g{N}_{group}.png — tight detail per group
+
+            # Initialize result entries (one per frame)
             for i, frame in enumerate(top_frames):
-                jank_type = frame["jank_type"]
-                dur_ms = frame["actual_dur_ms"]
-                ts = frame["ts"]
-                dur = frame["dur"]
-                safe_name = jank_type.replace(",", "").replace(" ", "_")[:40]
+                results.append({
+                    "name": frame["jank_type"],
+                    "dur_ms": frame["actual_dur_ms"],
+                    "ts": frame["ts"],
+                    "screenshots": {},  # filled by group loop below
+                    "success": True,
+                })
 
-                print(f"\n  [2.4.{i+1}] [{i+1}/{len(top_frames)}] {jank_type} ({dur_ms:.1f}ms)")
+            for g_idx, group in enumerate(pin_groups):
+                print(f"\n  [2.4.{g_idx+1}] Group '{group['name']}' ({group['label']}) — pinning once...")
 
-                # Reset: unpin, collapse, close drawer, clear search
+                # Pin this group's tracks ONCE for all jank frames
                 _cmd(page, 'dev.perfetto.UnpinAllTracks')
                 _cmd(page, 'dev.perfetto.CollapseAllGroups')
                 _close_drawer(page)
                 _clear_search(page)
                 time.sleep(0.3)
 
-                # Expand target process + SF groups so their children are pinnable
+                # Expand parent groups so children are discoverable
                 _cmd(page, 'dev.perfetto.ExpandTracksByRegex', target['process_name'])
                 time.sleep(0.3)
                 _cmd(page, 'dev.perfetto.ExpandTracksByRegex', 'surfaceflinger')
                 time.sleep(0.3)
 
-                # Pin all rendering pipeline tracks (order matters for top-to-bottom layout)
-                for pat in pin_patterns:
+                # Pin patterns in this group (order matters for top-bottom layout)
+                for pat in group["patterns"]:
                     _cmd(page, 'dev.perfetto.PinTracksByRegex', pat)
                     time.sleep(0.2)
 
-                # Collapse all non-pinned tracks (pinned stay at top)
+                # Collapse non-pinned to keep pinned tracks at top
                 _cmd(page, 'dev.perfetto.CollapseAllGroups')
                 time.sleep(0.3)
 
-                # === Overview screenshot ===
-                overview_pad = max(int(dur * 3), 500_000_000)  # min 500ms total context
-                _zoom_to(page, ts - overview_pad, ts + dur + overview_pad)
-                time.sleep(1.5)
-                _dismiss_cookie(page)
-                _close_drawer(page)
-                _hide_nonpinned_tracks(page)
+                # Inner loop: take screenshots for every jank frame at this group's pin
+                for i, frame in enumerate(top_frames):
+                    jank_type = frame["jank_type"]
+                    dur_ms = frame["actual_dur_ms"]
+                    ts = frame["ts"]
+                    dur = frame["dur"]
+                    safe_name = jank_type.replace(",", "").replace(" ", "_")[:40]
 
-                overview_file = f"{i:02d}_{safe_name}_overview.png"
-                _take_screenshot(page, output / overview_file)
-                print(f"         -> {overview_file}")
+                    # First group also produces the wide overview
+                    if g_idx == 0:
+                        overview_pad = max(int(dur * 3), 500_000_000)
+                        _zoom_to(page, ts - overview_pad, ts + dur + overview_pad)
+                        time.sleep(1.0)
+                        _close_drawer(page)
+                        _hide_nonpinned_tracks(page)
 
-                # === Detail screenshot: tight zoom for slice readability ===
-                detail_window = max(int(dur * 0.5), 50_000_000)
-                _zoom_to(page, ts - detail_window, ts + dur + detail_window)
-                time.sleep(1.0)
-                _dismiss_cookie(page)
-                _close_drawer(page)
-                _hide_nonpinned_tracks(page)
+                        overview_file = f"{i:02d}_{safe_name}_overview.png"
+                        _take_screenshot(page, output / overview_file)
+                        results[i]["screenshots"]["overview"] = overview_file
+                        print(f"         [{i+1}/5] {jank_type[:30]} -> overview")
 
-                detail_file = f"{i:02d}_{safe_name}_detail.png"
-                _take_screenshot(page, output / detail_file)
-                print(f"         -> {detail_file}")
+                    # Detail screenshot for this group (tight zoom for slice readability)
+                    detail_window = max(int(dur * 0.5), 50_000_000)
+                    _zoom_to(page, ts - detail_window, ts + dur + detail_window)
+                    time.sleep(0.8)
+                    _close_drawer(page)
+                    _hide_nonpinned_tracks(page)
 
-                results.append({
-                    "name": jank_type,
-                    "overview": overview_file,
-                    "detail": detail_file,
-                    "dur_ms": dur_ms,
-                    "ts": ts,
-                    "success": True,
-                })
+                    group_file = f"{i:02d}_{safe_name}_g{g_idx}_{group['name']}.png"
+                    _take_screenshot(page, output / group_file)
+                    results[i]["screenshots"][group["name"]] = group_file
+                    print(f"         [{i+1}/5] {jank_type[:30]} -> {group['name']}")
 
             browser.close()
     finally:
