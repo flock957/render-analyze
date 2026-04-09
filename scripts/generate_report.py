@@ -368,42 +368,14 @@ def main():
                 html += f'<tr><td>#{f["id"]}</td><td>{f["actual_dur_ms"]:.1f}ms</td><td>{f["jank_type"]}</td></tr>\n'
             html += '</table>\n'
 
-        # Screenshots — supports both legacy (overview/detail) and new grouped format
+        # Screenshots
         if manifest and i < len(manifest.get("screenshots", [])):
             ss = manifest["screenshots"][i]
-
-            # New grouped format: ss["screenshots"] dict with keys like overview, app, sf, hal
-            if "screenshots" in ss and isinstance(ss["screenshots"], dict):
-                group_labels = {
-                    "overview": "概览图（宽上下文）",
-                    "app": "App + Frame Timeline 层",
-                    "sf": "SurfaceFlinger 渲染管线",
-                    "hal": "Display HAL + 内核层",
-                }
-                # Render in fixed order: overview first, then app, sf, hal
-                for key in ["overview", "app", "sf", "hal"]:
-                    if key not in ss["screenshots"]:
-                        continue
-                    fname = ss["screenshots"][key]
-                    img_path = screenshots_dir / fname
-                    if img_path.exists():
-                        b64 = base64.b64encode(img_path.read_bytes()).decode()
-                        label = group_labels.get(key, key)
-                        html += f'''<div class="screenshot">
-    <img src="data:image/png;base64,{b64}" alt="{fname}"
-         onclick="this.classList.toggle('expanded')"
-         title="点击查看大图 / Click to enlarge" />
-    <p class="screenshot-label">Perfetto 截图: {label} - {fname}</p>
-</div>\n'''
-            else:
-                # Legacy format: overview + detail keys at top level
-                for key, label in [("overview", "概览图"), ("detail", "详情图")]:
-                    if key not in ss:
-                        continue
-                    img_path = screenshots_dir / ss[key]
-                    if img_path.exists():
-                        b64 = base64.b64encode(img_path.read_bytes()).decode()
-                        html += f'''<div class="screenshot">
+            for key, label in [("overview", "概览图"), ("detail", "详情图")]:
+                img_path = screenshots_dir / ss[key]
+                if img_path.exists():
+                    b64 = base64.b64encode(img_path.read_bytes()).decode()
+                    html += f'''<div class="screenshot">
     <img src="data:image/png;base64,{b64}" alt="{ss[key]}"
          onclick="this.classList.toggle('expanded')"
          title="点击查看大图 / Click to enlarge" />
