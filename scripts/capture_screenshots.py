@@ -26,8 +26,11 @@ from pathlib import Path
 VIEWPORT_WIDTH = 1920
 VIEWPORT_HEIGHT = 2400
 
-# trace_processor binary for HTTP RPC mode
-TRACE_PROCESSOR_BIN = "/home/wq/workspace/test_render_traces/trace_processor"
+# trace_processor binary port for HTTP RPC mode.
+# The binary path itself is auto-discovered via shutil.which("trace_processor")
+# or supplied via the --trace-processor CLI argument. If neither is available
+# the workflow falls back to in-browser file upload, which is slightly slower
+# but functionally equivalent.
 TRACE_PROCESSOR_PORT = 9001
 
 
@@ -36,6 +39,15 @@ def main():
     parser.add_argument("--trace", required=True)
     parser.add_argument("--analysis-dir", required=True)
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument(
+        "--trace-processor",
+        default=None,
+        help=(
+            "Path to a trace_processor binary used for HTTP RPC mode. "
+            "Default: auto-discover via $PATH (shutil.which). "
+            "If neither is available, falls back to in-browser file upload."
+        ),
+    )
     args = parser.parse_args()
 
     trace = Path(args.trace)
@@ -66,7 +78,7 @@ def main():
     # --- Start trace_processor HTTP RPC server (loads trace ONCE) ---
     size_mb = trace.stat().st_size // 1024 // 1024
     print(f"  [2.0] Starting trace_processor HTTP RPC for {size_mb}MB trace...")
-    tp_proc = _start_trace_processor(trace)
+    tp_proc = _start_trace_processor(trace, args.trace_processor)
 
     try:
         with sync_playwright() as p:
@@ -241,11 +253,22 @@ def main():
 
 # ─── trace_processor HTTP RPC management ──────────────────────────────
 
-def _start_trace_processor(trace_path):
-    """Start trace_processor in HTTP RPC mode and wait for it to be ready."""
-    if not Path(TRACE_PROCESSOR_BIN).exists():
-        print(f"         WARNING: trace_processor not found at {TRACE_PROCESSOR_BIN}")
-        print(f"         Falling back to file upload mode")
+def _start_trace_processor(trace_path, override_bin=None):
+    """Start trace_processor in HTTP RPC mode and wait for it to be ready.
+
+    Discovery order for the binary:
+    1. The `--trace-processor` CLI override (if provided)
+    2. `shutil.which("trace_processor")` — i.e. anything on $PATH
+
+    Returns None if no binary is found, in which case the caller falls
+    back to in-browser file upload mode.
+    """
+    import shutil
+    bin_path = override_bin or shutil.which("trace_processor")
+    if not bin_path or not Path(bin_path).exists():
+        print(f"         trace_processor binary not found on $PATH")
+        print(f"         (pass --trace-processor /path/to/trace_processor to override)")
+        print(f"         Falling back to in-browser file upload mode")
         return None
 
     # Kill any existing instance on the port
@@ -257,7 +280,7 @@ def _start_trace_processor(trace_path):
 
     # Start trace_processor with HTTP RPC
     proc = subprocess.Popen(
-        [TRACE_PROCESSOR_BIN, "-D", str(trace_path)],
+        [bin_path, "-D", str(trace_path)],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True,
     )

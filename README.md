@@ -58,11 +58,12 @@ PLAYWRIGHT_BROWSERS_PATH=/path/to/ms-playwright \
 - Python 3.10+ (tested on 3.12.3)
 - `perfetto` (Python package, ≥ 0.16.0)
 - `playwright` (≥ 1.57.0) + chromium browser
-- A bundled `trace_processor` binary at
-  `/home/wq/workspace/test_render_traces/trace_processor` — adjust the
-  path constant `TRACE_PROCESSOR_BIN` in
-  `scripts/capture_screenshots.py` for your environment, or place a
-  `trace_processor` binary on `$PATH`. (TODO: make this auto-discover.)
+- *Optional, for faster trace loading*: a `trace_processor` binary on
+  `$PATH` (or pass `--trace-processor /path/to/trace_processor` to
+  `scripts/capture_screenshots.py`). If neither is available, the
+  workflow automatically falls back to in-browser file upload mode,
+  which is functionally equivalent and only marginally slower.
+  Download from <https://perfetto.dev/docs/quickstart/trace-analysis>.
 - A `.perfetto-trace` captured with frame timeline + render thread
   ftrace events enabled (`perfetto -c` config including
   `android.surfaceflinger.frametimeline`, `linux.ftrace` with the
