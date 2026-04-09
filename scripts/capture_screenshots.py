@@ -30,14 +30,6 @@ VIEWPORT_HEIGHT = 2400
 TRACE_PROCESSOR_BIN = "/home/wq/workspace/test_render_traces/trace_processor"
 TRACE_PROCESSOR_PORT = 9001
 
-# Chromium flags to allow HTTPS Perfetto UI to fetch from HTTP localhost RPC
-RPC_BROWSER_FLAGS = [
-    '--no-sandbox',
-    '--disable-web-security',
-    '--allow-running-insecure-content',
-    '--disable-features=BlockInsecurePrivateNetworkRequests',
-]
-
 
 def main():
     parser = argparse.ArgumentParser(description="Capture Perfetto trace screenshots")
@@ -74,29 +66,16 @@ def main():
     # --- Start trace_processor HTTP RPC server (loads trace ONCE) ---
     size_mb = trace.stat().st_size // 1024 // 1024
     print(f"  [2.0] Starting trace_processor HTTP RPC for {size_mb}MB trace...")
-    tp_proc, tp_version = _start_trace_processor(trace)
-
-    # Build the matching Perfetto UI URL to avoid version-mismatch dialog
-    if tp_version:
-        ui_url = f"https://ui.perfetto.dev/{tp_version}/"
-        print(f"         Using matched UI version: {ui_url}")
-    else:
-        ui_url = "https://ui.perfetto.dev"
+    tp_proc = _start_trace_processor(trace)
 
     try:
         with sync_playwright() as p:
-            # Use disable-web-security so HTTPS UI can fetch from HTTP localhost RPC
-            ctx = p.chromium.launch_persistent_context(
-                user_data_dir='/tmp/perfetto_screenshot_chromium',
-                headless=True,
-                args=RPC_BROWSER_FLAGS,
-                viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
-            )
-            page = ctx.new_page()
+            browser = p.chromium.launch(headless=True, args=['--no-sandbox'])
+            page = browser.new_page(viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT})
 
-            # --- Load Perfetto UI (matched version) ---
+            # --- Load Perfetto UI (will auto-detect RPC server) ---
             print("  [2.1] Loading Perfetto UI...")
-            page.goto(ui_url)
+            page.goto("https://ui.perfetto.dev")
             page.wait_for_load_state("networkidle")
             time.sleep(2)
             _dismiss_cookie(page)
@@ -107,39 +86,30 @@ def main():
             rpc_used = False
 
             if tp_proc is not None:
-                # Wait briefly for Perfetto UI to detect RPC and show dialog
+                # Wait briefly for Perfetto UI to auto-detect RPC server
+                # When detected, it may either:
+                # 1. Show "YES, use loaded trace" dialog
+                # 2. Auto-load the trace silently
                 time.sleep(3)
 
-                # Click the "YES, use loaded trace" button on the RPC dialog
+                # Try to click YES dialog if present
                 try:
-                    btn = page.locator("button:has-text('YES, use loaded trace')").first
-                    if btn.is_visible(timeout=3000):
+                    btn = page.locator("button:has-text('YES'), text='YES, use loaded trace'").first
+                    if btn.is_visible(timeout=2000):
                         btn.click()
+                        print(f"         RPC dialog accepted")
                         rpc_used = True
-                        print(f"         RPC accepted: 'YES, use loaded trace'")
-                        time.sleep(1)
                 except: pass
 
-                # Fallback: maybe it's already auto-loaded
+                # Check if trace is already loaded via RPC (no dialog needed)
                 if not rpc_used:
                     try:
                         loaded = page.evaluate(
                             "() => !!(window.app && window.app._activeTrace && window.app._activeTrace.timeline)"
                         )
                         if loaded:
-                            rpc_used = True
                             print(f"         RPC auto-loaded (no dialog)")
-                    except: pass
-
-                # Last resort: version mismatch dialog
-                if not rpc_used:
-                    try:
-                        btn = page.locator("button:has-text('Use mismatched version')").first
-                        if btn.is_visible(timeout=1000):
-                            btn.click()
                             rpc_used = True
-                            print(f"         RPC accepted via mismatch dialog")
-                            time.sleep(2)
                     except: pass
 
             if not rpc_used:
@@ -250,7 +220,7 @@ def main():
                     "success": True,
                 })
 
-            ctx.close()
+            browser.close()
     finally:
         _stop_trace_processor(tp_proc)
 
@@ -272,16 +242,11 @@ def main():
 # ─── trace_processor HTTP RPC management ──────────────────────────────
 
 def _start_trace_processor(trace_path):
-    """Start trace_processor in HTTP RPC mode and wait for it to be ready.
-
-    Returns: (subprocess, version_string) tuple. version_string is the
-    trace_processor version (e.g. "v54.0-7616314b3") used to navigate
-    Perfetto UI to the matching version, avoiding the version-mismatch dialog.
-    """
+    """Start trace_processor in HTTP RPC mode and wait for it to be ready."""
     if not Path(TRACE_PROCESSOR_BIN).exists():
         print(f"         WARNING: trace_processor not found at {TRACE_PROCESSOR_BIN}")
         print(f"         Falling back to file upload mode")
-        return None, None
+        return None
 
     # Kill any existing instance on the port
     try:
@@ -297,30 +262,28 @@ def _start_trace_processor(trace_path):
         start_new_session=True,
     )
 
-    # Wait for HTTP server to be ready and extract version from /status
-    import socket, urllib.request, re
+    # Wait for HTTP server to be ready (poll /status)
+    import socket
     t0 = time.time()
     while time.time() - t0 < 60:
         try:
             with socket.create_connection(("127.0.0.1", TRACE_PROCESSOR_PORT), timeout=1):
+                # Server is up, but trace might still be loading
+                # Wait for it to actually respond to status
+                import urllib.request
                 req = urllib.request.Request(f"http://127.0.0.1:{TRACE_PROCESSOR_PORT}/status")
                 try:
                     with urllib.request.urlopen(req, timeout=2) as resp:
                         if resp.status == 200:
-                            body = resp.read().decode("latin-1", errors="ignore")
-                            # Status response is protobuf with version string embedded
-                            # Looks like: "v54.0-7616314b3"
-                            m = re.search(r"v\d+\.\d+-[a-f0-9]+", body)
-                            version = m.group(0) if m else None
                             elapsed = time.time() - t0
-                            print(f"         trace_processor ready in {elapsed:.1f}s (version: {version})")
-                            return proc, version
+                            print(f"         trace_processor ready in {elapsed:.1f}s")
+                            return proc
                 except: pass
         except: pass
         time.sleep(0.5)
 
     print(f"         WARNING: trace_processor RPC not ready after 60s")
-    return proc, None
+    return proc
 
 
 def _stop_trace_processor(proc):
