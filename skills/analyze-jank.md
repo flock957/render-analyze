@@ -12,10 +12,13 @@ script: scripts/analyze_jank.py
 ## 使用
 
 ```bash
-/home/wq/miniforge3/bin/python3 scripts/analyze_jank.py \
+python3 scripts/analyze_jank.py \
   --trace /path/to/trace.perfetto-trace \
   --output-dir /path/to/output
 ```
+
+`python3` 必须能 `import perfetto.trace_processor` —— 见仓库根 README 的
+venv 安装说明。
 
 ## 输出文件
 
@@ -67,4 +70,4 @@ script: scripts/analyze_jank.py
 9. CrtcCommit（取第 1 条）
 
 ## 依赖
-- Python `perfetto` 模块（`/home/wq/miniforge3/bin/python3` 已安装）
+- Python `perfetto` 模块（`pip install perfetto`，详见 README）

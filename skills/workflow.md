@@ -10,16 +10,23 @@ version: 3.0
 ## 概述
 自动化分析 Android 渲染 jank 问题的完整流水线。
 
+## 前置条件
+
+已激活的 venv（或全局环境）已安装 `perfetto>=0.16.0` 和 `playwright>=1.57.0`，
+并且 `playwright install chromium` 已执行过。详见仓库根 README 的 Quick start 段。
+
+下面所有命令假设 `python3` 在 `$PATH` 中且能 import 上述两个包。
+
 ## 一键执行
 
 ```bash
-# 完整流程（需要用 miniforge3 的 python，已安装 perfetto + playwright）
-/home/wq/miniforge3/bin/python3 scripts/run_workflow.py \
+# 完整流程
+python3 scripts/run_workflow.py \
   --trace /path/to/trace.perfetto-trace \
   --output-dir /path/to/output
 
 # 只分析不截图（快速）
-/home/wq/miniforge3/bin/python3 scripts/run_workflow.py \
+python3 scripts/run_workflow.py \
   --trace /path/to/trace --output-dir /out --no-screenshots
 ```
 

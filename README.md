@@ -137,6 +137,12 @@ Drop the contents of `skills/` into your agent's skill directory and
 it can drive the workflow phase-by-phase, with reflection checkpoints
 between phases.
 
+The skill files invoke `python3` from `$PATH`. They assume the venv
+from *Quick start* is already activated (`source .venv/bin/activate`)
+or that `perfetto` and `playwright` are otherwise importable. Activate
+the venv before launching your agent so its subprocess inherits the
+right interpreter.
+
 ## Known limitations
 
 - Defaults assume a vivo/Honor device target process. Edit the
