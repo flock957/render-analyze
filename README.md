@@ -1,96 +1,166 @@
-# Trace Screenshot Skill
+# Render Jank Analysis (Perfetto)
 
-Perfetto trace 截图工具，可作为独立 skill 接入任何 workflow。
+Analyze Android render jank from a Perfetto trace and produce an HTML
+report with annotated Perfetto-UI screenshots of each problem frame.
 
-## 目录结构
+> **Branch policy.** `v4-stable` is the validated baseline. Use it.
+> `v4-pipeline` is the leading-edge branch with experimental work in
+> progress and is not guaranteed to produce correct screenshots.
 
-```
-trace_screenshot_skill/
-├── capture-trace-screenshot.md    # Skill 描述文件（放入 workflow 的 skill 目录）
-├── scripts/
-│   └── capture_trace_screenshot.py  # 截图脚本
-├── requirements.txt               # Python 依赖
-├── setup.bat                      # Windows 环境安装
-├── setup.sh                       # Linux/Mac 环境安装
-├── TRACE_SCREENSHOT_GUIDE.md      # 完整使用指南（给 AI 看的）
-└── README.md                      # 本文件
-```
+## What it does
 
-## 安装
+Given a `.perfetto-trace` from a problem device session, the workflow:
+
+1. **Analyzes jank frames** via `trace_processor` SQL — finds the top
+   problem frames by jank type, duration, and process.
+2. **Captures Perfetto-UI screenshots** of each top frame —
+   pins the right tracks (app main, RenderEngine, GPU completion,
+   binder, HWC, crtc), zooms to the jank window, takes overview +
+   detail screenshots.
+3. **Generates an HTML report** with the screenshots embedded as
+   base64 (single-file, easy to share).
+
+Output: a self-contained `render_report.html` (~1.6 MB for a 64 MB
+trace, 5 top jank issues × 2 screenshots each).
+
+## Quick start
 
 ```bash
-# Windows
-setup.bat
+# 1. Clone the stable branch
+git clone -b v4-stable https://github.com/flock957/render-analyze.git
+cd render-analyze
 
-# Linux / Mac
-./setup.sh
+# 2. Create a dedicated venv (DO NOT reuse other project venvs)
+python3 -m venv .venv
+.venv/bin/pip install perfetto playwright
+.venv/bin/playwright install chromium
+
+# 3. Run the full workflow
+.venv/bin/python3 scripts/run_workflow.py \
+  --trace /path/to/your.perfetto-trace \
+  --output-dir /path/to/output
 ```
 
-安装完成后会在当前目录生成 `.venv/` 虚拟环境。
+The workflow takes ~60 s for a 64 MB trace on a typical Linux dev box.
 
-## 接入你的 Workflow
+### If chromium is already cached
 
-### 1. 复制文件
+If you already have Playwright's Chromium downloaded somewhere
+(e.g. from another project), point at it instead of re-downloading:
 
-把 `capture-trace-screenshot.md` 放到你的 skill 目录：
-```
-your_workflow/
-├── your-workflow.md
-├── capture-trace-screenshot.md    # ← 复制过来
-└── scripts/
-    └── capture_trace_screenshot.py  # ← 复制过来
+```bash
+PLAYWRIGHT_BROWSERS_PATH=/path/to/ms-playwright \
+.venv/bin/python3 scripts/run_workflow.py --trace ... --output-dir ...
 ```
 
-### 2. 在 workflow 的 phases 中添加截图阶段
+## Requirements
 
-```yaml
-phases:
-  # ... 你的分析阶段 ...
-  - key: screenshot
-    label: 截图（可选）
-    desc: 捕获 Perfetto UI 问题片段截图
-    output: /your/output/screenshots/screenshot_manifest.json
-  - key: report
-    label: 生成报告
-    desc: 输出报告
-    output: /your/output/report.html
-```
+- Python 3.10+ (tested on 3.12.3)
+- `perfetto` (Python package, ≥ 0.16.0)
+- `playwright` (≥ 1.57.0) + chromium browser
+- A bundled `trace_processor` binary at
+  `/home/wq/workspace/test_render_traces/trace_processor` — adjust the
+  path constant `TRACE_PROCESSOR_BIN` in
+  `scripts/capture_screenshots.py` for your environment, or place a
+  `trace_processor` binary on `$PATH`. (TODO: make this auto-discover.)
+- A `.perfetto-trace` captured with frame timeline + render thread
+  ftrace events enabled (`perfetto -c` config including
+  `android.surfaceflinger.frametimeline`, `linux.ftrace` with the
+  graphics atrace categories).
 
-### 3. 在 workflow 正文中添加调用
-
-```markdown
-## 截图阶段（可选）
-
-python3 /path/to/scripts/capture_trace_screenshot.py \
-    --trace $TRACE_FILE \
-    --analysis-dir /your/output \
-    --output-dir /your/output/screenshots
-
-如果输出中 skipped_reason 不为空，跳过截图继续下一步。
-```
-
-## 输入要求
-
-分析结果 JSON 文件需包含：
-```json
-{
-    "has_issue": true,
-    "severity": "high",
-    "start_time": 187654000000000,
-    "end_time": 187656500000000
-}
-```
-
-## 输出
+## Output structure
 
 ```
-screenshots/
-├── 00_全局概览.png
-├── 01_主线程状态.png
-├── ...
-└── screenshot_manifest.json
+<output-dir>/
+├── render_report.html              # 1.6 MB self-contained report
+├── app_jank.json                   # Top jank frames per type
+├── jank_types.json                 # Jank type distribution
+├── sf_jank.json                    # SurfaceFlinger CPU misses
+├── target_process.json             # Detected target process
+├── thread_map.json                 # Pin patterns + tid map
+├── tp_state.json                   # trace_processor session state
+└── screenshots/
+    ├── 00_<jank_type>_overview.png # Wide context (~120 KB)
+    ├── 00_<jank_type>_detail.png   # Tight zoom slice readable (~120 KB)
+    ├── 01_..._overview.png
+    ├── 01_..._detail.png
+    ├── ...
+    └── screenshot_manifest.json    # Frame ts/dur/file map
 ```
 
-## 详细文档
+## Repository layout
 
-见 `TRACE_SCREENSHOT_GUIDE.md`，可直接给 AI 作为参考文档使用。
+```
+render-analyze/
+├── README.md                  # This file
+├── .gitignore
+├── scripts/
+│   ├── run_workflow.py        # Workflow entry point (use this)
+│   ├── analyze_jank.py        # Phase 1: SQL jank analysis
+│   ├── capture_screenshots.py # Phase 2: Perfetto UI screenshots
+│   └── generate_report.py     # Phase 3: HTML report
+├── skills/                    # AI-agent skill descriptions
+│   ├── workflow.md            #   Top-level workflow
+│   ├── analyze-jank.md        #   Phase 1 skill
+│   ├── capture-screenshots.md #   Phase 2 skill
+│   └── generate-report.md     #   Phase 3 skill
+└── docs/
+    ├── mambo_reference.md     # Honor Mambo screenshot skill (reference)
+    └── modification_plan.md   # Future improvement plan (P0-P3)
+```
+
+## How the screenshot capture works
+
+1. Start `trace_processor` HTTP RPC on a local port and load the
+   trace once into memory.
+2. Launch Playwright Chromium pointed at `https://ui.perfetto.dev`.
+3. Wait for the UI to detect the RPC server and load the trace
+   (typically ~9 s for a 64 MB trace).
+4. For each top jank frame:
+   - Unpin everything, expand parent groups, then pin the 9 patterns
+     from `thread_map.json` (frame timeline, app main, surfaceflinger,
+     RenderEngine, GPU completion, binder, HWC, crtc) in top-to-bottom
+     order.
+   - Zoom to the frame's `[ts, ts+dur]` plus padding for context.
+   - Take an overview screenshot (wide context).
+   - Re-zoom tighter for slice text readability.
+   - Take a detail screenshot.
+
+The whole capture phase is ~60 s for 5 frames × 2 screenshots each.
+
+## Skill integration
+
+The `skills/` directory holds Markdown skill descriptions designed
+for AI-agent platforms (the workflow runs equivalently from the CLI).
+Drop the contents of `skills/` into your agent's skill directory and
+it can drive the workflow phase-by-phase, with reflection checkpoints
+between phases.
+
+## Known limitations
+
+- Defaults assume a vivo/Honor device target process. Edit the
+  process detection in `scripts/analyze_jank.py` if your trace has
+  a different app to focus on.
+- The `trace_processor` binary path is hardcoded — see
+  *Requirements*.
+- Screenshots use the live `https://ui.perfetto.dev` over the
+  internet. Air-gapped environments need a self-hosted Perfetto UI
+  (not yet implemented; see `docs/modification_plan.md`).
+- Perfetto UI version updates can change pin/zoom command IDs and
+  break the capture flow. The current code targets the UI as of
+  early April 2026.
+
+## Reference
+
+- Perfetto trace processor:
+  <https://perfetto.dev/docs/analysis/trace-processor>
+- Perfetto UI command API:
+  <https://perfetto.dev/docs/visualization/perfetto-ui> (run
+  `app.commands.commands` in the UI's devtools console for the live
+  list)
+- Honor Mambo screenshot skill (architectural reference, not used
+  directly): see `docs/mambo_reference.md`
+
+## License
+
+Internal Honor / flock957. Not for redistribution.
