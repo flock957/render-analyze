@@ -39,11 +39,25 @@ RPC_BROWSER_FLAGS = [
 ]
 
 
+FILE_SERVER_PORT = 9002
+
+
 def main():
     parser = argparse.ArgumentParser(description="Capture Perfetto trace screenshots")
     parser.add_argument("--trace", required=True)
     parser.add_argument("--analysis-dir", required=True)
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument(
+        "--load-mode",
+        choices=["url", "rpc", "file"],
+        default="url",
+        help=(
+            "Trace loading strategy. "
+            "url: deep-link via local CORS file_server (default, recommended). "
+            "rpc: trace_processor HTTP RPC (legacy, cross-origin fragile). "
+            "file: in-browser file upload via Perfetto UI file chooser (slowest)."
+        ),
+    )
     args = parser.parse_args()
 
     trace = Path(args.trace)
@@ -73,17 +87,30 @@ def main():
 
     results = []
 
-    # --- Start trace_processor HTTP RPC server (loads trace ONCE) ---
+    # --- Load mode setup: url / rpc / file ---
     size_mb = trace.stat().st_size // 1024 // 1024
-    print(f"  [2.0] Starting trace_processor HTTP RPC for {size_mb}MB trace...")
-    tp_proc, tp_version = _start_trace_processor(trace)
+    tp_proc = None
+    tp_version = None
+    fs_server = None
+    ui_url = "https://ui.perfetto.dev"
 
-    # Build the matching Perfetto UI URL to avoid version-mismatch dialog
-    if tp_version:
-        ui_url = f"https://ui.perfetto.dev/{tp_version}/"
-        print(f"         Using matched UI version: {ui_url}")
-    else:
-        ui_url = "https://ui.perfetto.dev"
+    if args.load_mode == "url":
+        # URL deep-link: start a local CORS-enabled HTTP server that serves
+        # the trace's parent directory, then tell Perfetto UI to fetch it.
+        print(f"  [2.0] Starting local CORS file_server for {size_mb}MB trace ({args.load_mode})...")
+        sys.path.insert(0, str(Path(__file__).parent))
+        from file_server import start_file_server, stop_file_server  # noqa: E402
+        fs_server = start_file_server(trace.parent, FILE_SERVER_PORT)
+        print(f"         Serving {trace.parent} on http://127.0.0.1:{FILE_SERVER_PORT}/")
+    elif args.load_mode == "rpc":
+        print(f"  [2.0] Starting trace_processor HTTP RPC for {size_mb}MB trace ({args.load_mode})...")
+        tp_proc, tp_version = _start_trace_processor(trace)
+        # Build the matching Perfetto UI URL to avoid version-mismatch dialog
+        if tp_version:
+            ui_url = f"https://ui.perfetto.dev/{tp_version}/"
+            print(f"         Using matched UI version: {ui_url}")
+    else:  # "file"
+        print(f"  [2.0] Will load {size_mb}MB trace via in-browser file chooser ({args.load_mode})")
 
     try:
         with sync_playwright() as p:
@@ -96,57 +123,78 @@ def main():
             )
             page = ctx.new_page()
 
-            # --- Load Perfetto UI (matched version) ---
-            print("  [2.1] Loading Perfetto UI...")
-            page.goto(ui_url)
-            page.wait_for_load_state("networkidle")
-            time.sleep(2)
-            _dismiss_cookie(page)
-
-            # --- Load trace (try RPC first, fallback to file upload) ---
-            print("  [2.2] Loading trace...")
+            # --- Load Perfetto UI + trace ---
             t0 = time.time()
-            rpc_used = False
 
-            if tp_proc is not None:
-                # Wait briefly for Perfetto UI to detect RPC and show dialog
-                time.sleep(3)
+            if args.load_mode == "url":
+                # Deep-link: goto the UI with ?url= pointing at our file_server.
+                # Perfetto UI will fetch the trace itself — no RPC, no file chooser.
+                trace_url = f"http://127.0.0.1:{FILE_SERVER_PORT}/{trace.name}"
+                nav_url = f"{ui_url}/#!/?url={trace_url}"
+                print(f"  [2.1] Loading Perfetto UI via deep-link...")
+                print(f"         {nav_url}")
 
-                # Click the "YES, use loaded trace" button on the RPC dialog
-                try:
-                    btn = page.locator("button:has-text('YES, use loaded trace')").first
-                    if btn.is_visible(timeout=3000):
-                        btn.click()
-                        rpc_used = True
-                        print(f"         RPC accepted: 'YES, use loaded trace'")
-                        time.sleep(1)
-                except: pass
+                # Capture browser console to diagnose fetch/CORS/HTTPS failures
+                page.on("console", lambda msg: print(f"         [console.{msg.type}] {msg.text[:200]}"))
+                page.on("pageerror", lambda err: print(f"         [pageerror] {str(err)[:200]}"))
 
-                # Fallback: maybe it's already auto-loaded
-                if not rpc_used:
+                page.goto(nav_url)
+                # Don't wait for networkidle — the trace fetch itself counts as activity
+                time.sleep(2)
+                _dismiss_cookie(page)
+
+            elif args.load_mode == "rpc":
+                print("  [2.1] Loading Perfetto UI...")
+                page.goto(ui_url)
+                page.wait_for_load_state("networkidle")
+                time.sleep(2)
+                _dismiss_cookie(page)
+
+                print("  [2.2] Loading trace via trace_processor RPC...")
+                rpc_used = False
+                if tp_proc is not None:
+                    time.sleep(3)
+                    # Click the "YES, use loaded trace" button on the RPC dialog
                     try:
-                        loaded = page.evaluate(
-                            "() => !!(window.app && window.app._activeTrace && window.app._activeTrace.timeline)"
-                        )
-                        if loaded:
-                            rpc_used = True
-                            print(f"         RPC auto-loaded (no dialog)")
-                    except: pass
-
-                # Last resort: version mismatch dialog
-                if not rpc_used:
-                    try:
-                        btn = page.locator("button:has-text('Use mismatched version')").first
-                        if btn.is_visible(timeout=1000):
+                        btn = page.locator("button:has-text('YES, use loaded trace')").first
+                        if btn.is_visible(timeout=3000):
                             btn.click()
                             rpc_used = True
-                            print(f"         RPC accepted via mismatch dialog")
-                            time.sleep(2)
+                            print(f"         RPC accepted: 'YES, use loaded trace'")
+                            time.sleep(1)
                     except: pass
+                    # Fallback: already auto-loaded?
+                    if not rpc_used:
+                        try:
+                            loaded = page.evaluate(
+                                "() => !!(window.app && window.app._activeTrace && window.app._activeTrace.timeline)"
+                            )
+                            if loaded:
+                                rpc_used = True
+                                print(f"         RPC auto-loaded (no dialog)")
+                        except: pass
+                    # Last resort: version mismatch dialog
+                    if not rpc_used:
+                        try:
+                            btn = page.locator("button:has-text('Use mismatched version')").first
+                            if btn.is_visible(timeout=1000):
+                                btn.click()
+                                rpc_used = True
+                                print(f"         RPC accepted via mismatch dialog")
+                                time.sleep(2)
+                        except: pass
+                if not rpc_used:
+                    print("         RPC load did not succeed")
+                    raise RuntimeError("RPC load failed — try --load-mode url or file")
 
-            if not rpc_used:
-                # Fall back to file upload
-                print("         Using file upload...")
+            else:  # "file"
+                print("  [2.1] Loading Perfetto UI...")
+                page.goto(ui_url)
+                page.wait_for_load_state("networkidle")
+                time.sleep(2)
+                _dismiss_cookie(page)
+
+                print("  [2.2] Loading trace via file chooser...")
                 try:
                     with page.expect_file_chooser(timeout=5000) as fc:
                         page.click("text=Open trace file")
@@ -155,16 +203,34 @@ def main():
                     print(f"         File upload failed: {e}")
                     raise
 
-            # --- Wait for trace to be fully loaded (DOM-based, not sleep) ---
-            print("  [2.2.1] Waiting for trace to be ready...")
+            # --- Wait for trace to be fully loaded ---
+            # Primary wait: DOM XPath for "Process" — stable across Perfetto v48+
+            # (Mambo's approach; works regardless of load mode).
+            print("  [2.2.1] Waiting for trace to be ready (DOM)...")
+            dom_ready = False
+            try:
+                page.wait_for_selector(
+                    "xpath=//div[contains(text(), 'Process ')]",
+                    timeout=120000,
+                    state="visible",
+                )
+                dom_ready = True
+                print(f"         DOM ready in {time.time()-t0:.1f}s")
+            except Exception as e:
+                print(f"         DOM wait timeout: {e}")
+
+            # Secondary wait: window.app._activeTrace — needed for our JS commands
+            # below (_zoom_to, _cmd). Shorter timeout since DOM is already visible.
             try:
                 page.wait_for_function(
                     "() => window.app && window.app._activeTrace && window.app._activeTrace.timeline",
-                    timeout=120000,
+                    timeout=30000,
                 )
-                print(f"         Trace ready in {time.time()-t0:.1f}s ({'RPC' if rpc_used else 'file upload'})")
+                if dom_ready:
+                    print(f"         JS API ready (mode={args.load_mode})")
             except Exception as e:
-                print(f"         Wait timeout: {e}")
+                print(f"         JS API wait timeout: {e}")
+
             time.sleep(2)  # small grace period for UI render
             _dismiss_cookie(page)
 
@@ -266,6 +332,12 @@ def main():
             ctx.close()
     finally:
         _stop_trace_processor(tp_proc)
+        if fs_server is not None:
+            try:
+                from file_server import stop_file_server  # noqa: E402
+                stop_file_server(fs_server)
+            except Exception:
+                pass
 
     # Write manifest
     manifest = {
