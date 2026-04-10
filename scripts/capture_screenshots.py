@@ -199,10 +199,14 @@ def main():
                 _cmd(page, 'dev.perfetto.CollapseAllGroups')
                 time.sleep(0.5)
 
-                # Step 3: Pin SF/HWC (top-level tracks → pinned at top)
-                for pat in ['surfaceflinger', 'composer-servic']:
-                    _cmd(page, 'dev.perfetto.PinTracksByRegex', pat)
+                # Step 3: Pin ONLY SF main thread + composer (compact pinned area).
+                # Use exact "surfaceflinger {tid}" to avoid pinning all SF sub-threads.
+                sf_tid = thread_map.get('sf_main_tid', '')
+                if sf_tid:
+                    _cmd(page, 'dev.perfetto.PinTracksByRegex', f'surfaceflinger {sf_tid}')
                     time.sleep(0.2)
+                _cmd(page, 'dev.perfetto.PinTracksByRegex', 'composer-servic')
+                time.sleep(0.2)
                 page.keyboard.press("Escape")
                 time.sleep(0.2)
                 page.keyboard.press("Escape")
@@ -236,7 +240,12 @@ def main():
                 time.sleep(5)
                 _force_hide_ui_noise(page)
 
-                _search_and_navigate(page, "Choreographer")
+                # Search "DrawFrames" to center on RenderThread.
+                # This puts main thread ABOVE and GPU completion BELOW in view,
+                # covering the full Frame Timeline: main → RT → GPU completion.
+                # (Searching "Choreographer" puts main thread at top, cutting off
+                # GPU completion at the bottom.)
+                _search_and_navigate(page, "DrawFrames")
 
                 global_file = f"{i:02d}_{safe_name}_global.png"
                 page.screenshot(path=str(output / global_file))
