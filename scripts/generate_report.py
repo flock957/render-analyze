@@ -368,19 +368,70 @@ def main():
                 html += f'<tr><td>#{f["id"]}</td><td>{f["actual_dur_ms"]:.1f}ms</td><td>{f["jank_type"]}</td></tr>\n'
             html += '</table>\n'
 
-        # Screenshots
+        # Problem-frame metadata (always shown — sourced from app_jank.json enrichment)
+        rr = frame.get("region_range", {})
+        kw_hit = frame.get("keywords_hit", []) or []
+        ev = frame.get("evidence_slices", []) or []
+        target_ts_v = frame.get("target_ts", frame.get("ts"))
+        focus_track_v = frame.get("focus_track", "-")
+        problem_desc = frame.get("problem_description", "-")
+        screenshot_reason = frame.get("screenshot_reasoning",
+            "先用全局图覆盖整段 trace 看分布，再在 target_ts ± 窗口的细节图收敛并点选证据 slice。")
+
+        if ev:
+            ev_rows = "".join(
+                f'<tr><td><code>{e.get("name", "-")}</code></td>'
+                f'<td>{e.get("thread", "-")}</td>'
+                f'<td>{e.get("dur_ms", 0)} ms</td>'
+                f'<td>{e.get("ts", "-")} ns</td></tr>\n'
+                for e in ev[:5]
+            )
+            ev_block = (
+                '<h5 style="margin-top:12px">证据 slices (Top 5)</h5>'
+                '<table><tr><th>Slice</th><th>线程</th><th>耗时</th><th>起点 ts</th></tr>'
+                f'{ev_rows}</table>'
+            )
+        else:
+            ev_block = '<p style="color:#8b949e;font-size:13px">未命中关键词 slices（关键词集为空或对应阶段无 slice 数据）。</p>'
+
+        html += '<h4>问题帧元数据</h4><table>\n'
+        html += '<tr><th style="width:120px">字段</th><th>内容</th></tr>\n'
+        html += f'<tr><td>问题类型</td><td>{jt}</td></tr>\n'
+        html += f'<tr><td>对应帧</td><td>#{frame.get("id")}（实际耗时 {dur:.1f} ms）</td></tr>\n'
+        html += (
+            f'<tr><td>捷区范围</td>'
+            f'<td>{rr.get("start_ts", "-")} ~ {rr.get("end_ts", "-")} ns '
+            f'（约 {rr.get("window_ms", 0)} ms）</td></tr>\n'
+        )
+        html += f'<tr><td>目标时刻</td><td>{target_ts_v} ns</td></tr>\n'
+        html += f'<tr><td>焦点轨道</td><td>{focus_track_v}</td></tr>\n'
+        html += f'<tr><td>命中关键词</td><td>{", ".join(kw_hit) or "-"}</td></tr>\n'
+        html += f'<tr><td>问题描述</td><td>{problem_desc}</td></tr>\n'
+        html += f'<tr><td>截图逻辑</td><td>{screenshot_reason}</td></tr>\n'
+        html += '</table>\n'
+        html += ev_block
+
+        # Screenshots (if captured)
         if manifest and i < len(manifest.get("screenshots", [])):
             ss = manifest["screenshots"][i]
-            for key, label in [("overview", "概览图"), ("detail", "详情图")]:
-                img_path = screenshots_dir / ss[key]
+            for key, label in [("global", "全局图"), ("detail", "局部细节图")]:
+                fname = ss.get(key)
+                if not fname:
+                    continue
+                img_path = screenshots_dir / fname
                 if img_path.exists():
                     b64 = base64.b64encode(img_path.read_bytes()).decode()
                     html += f'''<div class="screenshot">
-    <img src="data:image/png;base64,{b64}" alt="{ss[key]}"
+    <img src="data:image/png;base64,{b64}" alt="{fname}"
          onclick="this.classList.toggle('expanded')"
          title="点击查看大图 / Click to enlarge" />
-    <p class="screenshot-label">Perfetto 截图: {label} - {ss[key]}</p>
+    <p class="screenshot-label">Perfetto 截图: {label} - {fname}</p>
 </div>\n'''
+
+            html += '<div class="reasoning-callout">'
+            html += '<h5>截图复盘说明</h5>'
+            html += f'<p>{screenshot_reason}</p>'
+            html += '</div>\n'
 
         # Framework analysis
         if kb:
@@ -506,6 +557,9 @@ tr:hover td {{ background: #161b22; }}
 .optimizations .opt-list li {{ padding: 6px 0 6px 20px; font-size: 14px; position: relative; }}
 .optimizations .opt-list li::before {{ content: ">>"; position: absolute; left: 0; color: #3fb950; }}
 .issue-num {{ display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 50%; background: #1f6feb; color: #fff; font-weight: 700; font-size: 14px; margin-right: 8px; }}
+.reasoning-callout {{ background: #0f1720; border: 1px solid #26415e; border-left: 3px solid #58a6ff; border-radius: 6px; padding: 12px 16px; margin: 14px 0; }}
+.reasoning-callout h5 {{ color: #58a6ff; margin-bottom: 6px; }}
+.reasoning-callout p {{ font-size: 13px; line-height: 1.6; color: #c9d1d9; }}
 footer {{ text-align: center; padding: 32px 0; color: #484f58; font-size: 13px; border-top: 1px solid #21262d; margin-top: 40px; }}
 </style>
 </head>

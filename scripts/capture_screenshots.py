@@ -4,14 +4,14 @@
 v4: Uses trace_processor HTTP RPC for fast loading.
 - Starts trace_processor --httpd in background (loads trace once)
 - Perfetto UI connects via RPC, no file upload, no in-browser parsing
-- Tall viewport (1920x2400) for long screenshots
+- Portrait-long viewport (1072x1598) + high device scale for crisp detail
 - Full rendering pipeline pin: Timeline → App → SF → HWC → CrtcCommit
 - Auto-crop screenshots to pinned content area
 - DOM-based wait (not fixed sleep) for trace ready state
 
 Two screenshot types per jank:
-- Overview: ±500ms context for pattern recognition
-- Detail: tight zoom for slice text readability
+- Global: full trace window for global pattern recognition
+- Detail: narrowed window around target_ts and slice click for evidence focus
 """
 import argparse
 import json
@@ -22,9 +22,10 @@ import sys
 from pathlib import Path
 
 
-# Viewport dimensions — tall to show many pinned tracks
-VIEWPORT_WIDTH = 1920
-VIEWPORT_HEIGHT = 2400
+# Viewport dimensions — portrait long-shot
+VIEWPORT_WIDTH = 1072
+VIEWPORT_HEIGHT = 1598
+DEVICE_SCALE_FACTOR = 2.0
 
 # trace_processor binary port for HTTP RPC mode.
 # The binary path itself is auto-discovered via shutil.which("trace_processor")
@@ -59,6 +60,7 @@ def main():
     app_jank = _load(analysis / "app_jank.json")
     target = _load(analysis / "target_process.json")
     thread_map = _load(analysis / "thread_map.json")
+    tp_state = _load(analysis / "tp_state.json")
 
     top_frames = app_jank["top_frames"][:5]
     pin_patterns = thread_map["pin_patterns"]
@@ -83,7 +85,10 @@ def main():
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=['--no-sandbox'])
-            page = browser.new_page(viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT})
+            page = browser.new_page(
+                viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
+                device_scale_factor=DEVICE_SCALE_FACTOR,
+            )
 
             # --- Load Perfetto UI (will auto-detect RPC server) ---
             print("  [2.1] Loading Perfetto UI...")
@@ -195,29 +200,44 @@ def main():
                     _cmd(page, 'dev.perfetto.PinTracksByRegex', pat)
                     time.sleep(0.2)
 
+                # Dismiss any lingering omnibox/track-path dialog left by pin commands
+                page.keyboard.press("Escape")
+                time.sleep(0.2)
+                page.keyboard.press("Escape")
+                time.sleep(0.2)
+
                 # Collapse all non-pinned tracks (pinned stay at top)
                 _cmd(page, 'dev.perfetto.CollapseAllGroups')
                 time.sleep(0.3)
 
-                # === Overview screenshot ===
-                overview_pad = max(int(dur * 3), 500_000_000)  # min 500ms total context
-                _zoom_to(page, ts - overview_pad, ts + dur + overview_pad)
+                target_ts = int(frame.get("target_ts", ts))
+                focus_track = frame.get("focus_track", "Actual Timeline")
+
+                # === Global screenshot (full trace window) ===
+                global_start = int(tp_state["trace_start"])
+                global_end = int(tp_state["trace_end"])
+                _zoom_to(page, global_start, global_end)
                 time.sleep(1.5)
                 _dismiss_cookie(page)
                 _close_drawer(page)
-                _hide_nonpinned_tracks(page)
+                _hide_drawer_and_cookies(page)
 
-                overview_file = f"{i:02d}_{safe_name}_overview.png"
-                _take_screenshot(page, output / overview_file)
-                print(f"         -> {overview_file}")
+                global_file = f"{i:02d}_{safe_name}_global.png"
+                _take_screenshot(page, output / global_file)
+                print(f"         -> {global_file}")
 
-                # === Detail screenshot: tight zoom for slice readability ===
-                detail_window = max(int(dur * 0.5), 50_000_000)
-                _zoom_to(page, ts - detail_window, ts + dur + detail_window)
+                # === Detail screenshot: target_ts-centered + click evidence slice ===
+                detail_window = max(int(dur * 2), 80_000_000)
+                detail_start = target_ts - detail_window
+                detail_end = target_ts + detail_window
+                _zoom_to(page, detail_start, detail_end)
                 time.sleep(1.0)
+                _focus_track_y(page, focus_track)
+                _click_slice_at(page, target_ts, detail_start, detail_end)
+                time.sleep(0.4)
                 _dismiss_cookie(page)
                 _close_drawer(page)
-                _hide_nonpinned_tracks(page)
+                _hide_drawer_and_cookies(page)
 
                 detail_file = f"{i:02d}_{safe_name}_detail.png"
                 _take_screenshot(page, output / detail_file)
@@ -225,10 +245,17 @@ def main():
 
                 results.append({
                     "name": jank_type,
-                    "overview": overview_file,
+                    "global": global_file,
                     "detail": detail_file,
                     "dur_ms": dur_ms,
                     "ts": ts,
+                    "target_ts": target_ts,
+                    "focus_track": focus_track,
+                    "keywords_hit": frame.get("keywords_hit", []),
+                    "evidence_slices": frame.get("evidence_slices", []),
+                    "region_range": frame.get("region_range", {}),
+                    "problem_description": frame.get("problem_description", ""),
+                    "screenshot_reasoning": frame.get("screenshot_reasoning", ""),
                     "success": True,
                 })
 
@@ -243,7 +270,11 @@ def main():
         "total_jank": app_jank.get("jank_frames", 0),
         "captured": len(results),
         "pin_patterns": pin_patterns,
-        "viewport": {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
+        "viewport": {
+            "width": VIEWPORT_WIDTH,
+            "height": VIEWPORT_HEIGHT,
+            "device_scale_factor": DEVICE_SCALE_FACTOR,
+        },
         "screenshots": results,
     }
     _write(output / "screenshot_manifest.json", manifest)
@@ -414,44 +445,24 @@ def _clear_search(page):
     except: pass
 
 
-def _hide_nonpinned_tracks(page):
-    """Hide non-pinned tracks and bottom panels to maximize useful content.
+def _hide_drawer_and_cookies(page):
+    """Hide the bottom drawer panel and any cookie banners.
 
-    Strategy: find all panel containers in Perfetto UI and hide everything
-    that isn't the overview bar, pinned tracks, or timeline header.
+    Uses only narrow, well-known selectors so we don't accidentally hide the
+    pinned tracks or main scroll container.
     """
     try:
         page.evaluate("""
             (() => {
-                // 1. Hide the bottom details/drawer panel
-                document.querySelectorAll(
-                    '.pf-bottom-panel, .pf-details-panel, ' +
-                    '[class*="bottom-panel"], [class*="details-panel"], ' +
-                    '[class*="bottomPanel"], [class*="detailsPanel"]'
-                ).forEach(el => el.style.display = 'none');
+                const drawerSelectors = [
+                    '.pf-bottom-panel', '.pf-details-panel',
+                    '[class*="bottom-panel"]', '[class*="details-panel"]',
+                    '[class*="bottomPanel"]', '[class*="detailsPanel"]'
+                ];
+                document.querySelectorAll(drawerSelectors.join(',')).forEach(el => {
+                    try { el.style.display = 'none'; } catch(e) {}
+                });
 
-                // 2. Find and hide the non-pinned scrollable track area
-                //    In Perfetto, the structure is:
-                //    - Overview/timeline bar (keep)
-                //    - Pinned tracks panel (keep)
-                //    - Scrollable tracks panel (HIDE - this has all the collapsed groups)
-                //    Look for the panel after pinned tracks
-                const allPanels = document.querySelectorAll(
-                    '.pf-panel-container > div, ' +
-                    '[class*="panel-container"] > div'
-                );
-
-                // 3. More aggressive: hide any element that contains collapsed track groups
-                //    but is NOT a pinned track
-                const scrollContainer = document.querySelector(
-                    '.pf-tracks-panel, [class*="tracks-panel"], ' +
-                    '[class*="scrolling-panel"], [class*="scrollingPanel"]'
-                );
-                if (scrollContainer) {
-                    scrollContainer.style.display = 'none';
-                }
-
-                // 4. Cookie cleanup
                 document.querySelectorAll(
                     '[class*="cookie"], [id*="cookie"], [class*="consent"]'
                 ).forEach(el => el.remove());
@@ -460,64 +471,90 @@ def _hide_nonpinned_tracks(page):
     except: pass
 
 
-def _take_screenshot(page, filepath):
-    """Take a cropped screenshot focusing on the pinned tracks area.
-
-    Crops from top to the bottom of the last pinned track,
-    eliminating wasted space from collapsed non-pinned track groups.
-    """
-    # Detect the effective content height (overview bar + pinned tracks)
+def _focus_track_y(page, focus_track):
+    """Best-effort: locate a track label whose text contains focus_track and
+    scroll it into view. Sticky-pinned tracks are no-ops, which is fine —
+    they're already visible at the top."""
+    if not focus_track:
+        return
     try:
-        content_bottom = page.evaluate("""
-            (() => {
-                // Find pinned track area - look for pin icons or pinned container
-                const pinIcons = document.querySelectorAll(
-                    '[class*="pin"], .pf-pin-icon, [title*="Unpin"]'
-                );
-                let maxBottom = 0;
-                pinIcons.forEach(el => {
-                    const r = el.getBoundingClientRect();
-                    // Walk up to find the track row container
-                    let parent = el.closest('[class*="track"], [class*="row"]') || el;
-                    const pr = parent.getBoundingClientRect();
-                    if (pr.bottom > maxBottom) maxBottom = pr.bottom;
-                });
-
-                // If we found pinned tracks, add some padding
-                if (maxBottom > 100) {
-                    return Math.min(maxBottom + 30, window.innerHeight);
-                }
-
-                // Fallback: find the last visible track with content
-                const tracks = document.querySelectorAll(
-                    '[class*="track-shell"], [class*="trackShell"]'
-                );
-                tracks.forEach(el => {
-                    const r = el.getBoundingClientRect();
-                    if (r.bottom > maxBottom && r.top < window.innerHeight) {
-                        maxBottom = r.bottom;
+        page.evaluate(
+            """(focusTrack) => {
+                const needle = (focusTrack || '').toLowerCase();
+                if (!needle) return false;
+                const labels = Array.from(document.querySelectorAll(
+                    '[class*="track-shell"], [class*="trackShell"], ' +
+                    '[class*="track-name"], [class*="trackName"], ' +
+                    '[class*="pf-track"]'
+                ));
+                for (const el of labels) {
+                    const text = (el.textContent || '').trim().toLowerCase();
+                    if (text && text.includes(needle)) {
+                        try { el.scrollIntoView({block: 'center', inline: 'nearest'}); } catch(e) {}
+                        return true;
                     }
-                });
-
-                if (maxBottom > 100) {
-                    return Math.min(maxBottom + 30, window.innerHeight);
                 }
+                return false;
+            }""",
+            focus_track,
+        )
+    except Exception:
+        pass
 
-                // Ultimate fallback: use 60% of viewport (pinned tracks typically fill top portion)
-                return Math.floor(window.innerHeight * 0.6);
+
+def _click_slice_at(page, target_ts, vis_start_ns, vis_end_ns):
+    """Click on the canvas at the x-position corresponding to target_ts.
+
+    We compute the click x in CSS pixels using the known visible window range
+    (vis_start_ns, vis_end_ns) and use Playwright's real mouse click so that
+    Perfetto's canvas hit-testing receives proper pointer events.
+    """
+    try:
+        if vis_end_ns <= vis_start_ns:
+            return
+        ratio = (int(target_ts) - int(vis_start_ns)) / (int(vis_end_ns) - int(vis_start_ns))
+        ratio = max(0.05, min(0.95, ratio))
+        # Discover canvas / track area bounding box (skip the left track-label gutter)
+        bbox = page.evaluate("""
+            (() => {
+                const candidates = document.querySelectorAll(
+                    '[class*="pf-track"], [class*="trackShell"], [class*="track-shell"]'
+                );
+                let best = null;
+                for (const el of candidates) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width > 200 && r.height > 10 && r.top < window.innerHeight) {
+                        if (!best || r.width > best.width) best = {x: r.x, y: r.y, w: r.width, h: r.height};
+                    }
+                }
+                if (best) return best;
+                // Fallback: assume the canvas occupies the right 80% of viewport
+                return {x: Math.floor(window.innerWidth * 0.2), y: Math.floor(window.innerHeight * 0.3),
+                        w: Math.floor(window.innerWidth * 0.78), h: Math.floor(window.innerHeight * 0.4)};
             })()
         """)
-
-        if content_bottom and content_bottom > 200:
-            page.screenshot(
-                path=str(filepath),
-                clip={"x": 0, "y": 0, "width": VIEWPORT_WIDTH, "height": int(content_bottom)}
-            )
+        if not bbox:
             return
-    except Exception as e:
-        print(f"         [crop] fallback to full: {e}")
+        # Aim above any left-side label gutter (assume gutter ~ 200px from x)
+        gutter = 200
+        track_x = bbox["x"] + gutter
+        track_w = max(50, bbox["w"] - gutter)
+        click_x = track_x + track_w * ratio
+        click_y = bbox["y"] + bbox["h"] * 0.5
+        page.mouse.move(click_x, click_y)
+        page.mouse.click(click_x, click_y)
+    except Exception:
+        pass
 
-    # Fallback: full viewport
+
+def _take_screenshot(page, filepath):
+    """Take a full portrait viewport screenshot.
+
+    The viewport is intentionally fixed to a tall portrait shape (1072x1598)
+    so a single page.screenshot already crops one large vertical region.
+    No further cropping is applied — the bottom portion (collapsed group
+    labels) is kept on purpose as visual context.
+    """
     page.screenshot(path=str(filepath))
 
 

@@ -9,6 +9,24 @@ import json
 import sys
 from pathlib import Path
 
+KEYWORDS_BY_JANK_TYPE = {
+    "App Deadline Missed": ["doFrame", "performTraversals", "DrawFrame", "RenderThread", "queueBuffer"],
+    "Buffer Stuffing": ["dequeueBuffer", "queueBuffer", "acquireBuffer", "latchBuffer"],
+    "SurfaceFlinger CPU Deadline Missed": ["onMessageRefresh", "commit", "composite", "RenderEngine"],
+    "Display HAL": ["presentFence", "presentDisplay", "composer", "hwc"],
+    "Prediction Error": ["Expected Timeline", "Actual Timeline", "VSync"],
+    "SurfaceFlinger Scheduling": ["surfaceflinger", "onMessageRefresh", "sched"],
+}
+
+FOCUS_TRACK_BY_JANK_TYPE = {
+    "App Deadline Missed": "RenderThread",
+    "Buffer Stuffing": "dequeueBuffer",
+    "SurfaceFlinger CPU Deadline Missed": "surfaceflinger",
+    "Display HAL": "presentFence",
+    "Prediction Error": "Actual Timeline",
+    "SurfaceFlinger Scheduling": "surfaceflinger",
+}
+
 
 def main():
     parser = argparse.ArgumentParser(description="Analyze jank frames in a Perfetto trace")
@@ -106,6 +124,8 @@ def main():
         if jt not in by_type or j["dur"] > by_type[jt]["dur"]:
             by_type[jt] = j
     top_frames = sorted(by_type.values(), key=lambda x: -x["dur"])[:5]
+    for frame in top_frames:
+        _enrich_top_frame(tp, frame, trace_start, trace_end)
 
     # Per-type statistics: count, avg duration, top 3 frames
     type_stats = {}
@@ -280,6 +300,146 @@ def main():
 
     tp.close()
     print(f"\n[Phase 1] Complete -> {output}/")
+
+
+def _enrich_top_frame(tp, frame, trace_start, trace_end):
+    ts = int(frame["ts"])
+    dur = int(frame["dur"])
+    jank_type = frame["jank_type"]
+
+    around = max(int(dur * 2), 200_000_000)
+    region_start = max(int(trace_start), ts - around)
+    region_end = min(int(trace_end), ts + dur + around)
+
+    focus_track = _pick_focus_track(jank_type)
+    keywords = _pick_keywords(jank_type)
+
+    target_ts = _find_target_ts(tp, ts, dur, keywords)
+    evidence = _collect_evidence(tp, region_start, region_end, keywords)
+
+    frame["target_ts"] = int(target_ts)
+    frame["focus_track"] = focus_track
+    frame["evidence_slices"] = evidence
+    frame["keywords_hit"] = sorted(
+        {
+            kw
+            for ev in evidence
+            for kw in keywords
+            if kw.lower() in (ev.get("name") or "").lower()
+        }
+    )
+    frame["region_range"] = {
+        "start_ts": int(region_start),
+        "end_ts": int(region_end),
+        "window_ms": round((region_end - region_start) / 1e6, 1),
+    }
+    frame["problem_description"] = _build_problem_description(frame)
+    frame["screenshot_reasoning"] = _build_screenshot_reasoning(frame)
+
+
+def _pick_focus_track(jank_type):
+    for key, focus in FOCUS_TRACK_BY_JANK_TYPE.items():
+        if key in jank_type:
+            return focus
+    return "Actual Timeline"
+
+
+def _pick_keywords(jank_type):
+    for key, words in KEYWORDS_BY_JANK_TYPE.items():
+        if key in jank_type:
+            return words
+    return ["doFrame", "RenderThread", "surfaceflinger", "presentFence"]
+
+
+def _find_target_ts(tp, frame_ts, frame_dur, keywords):
+    frame_end = frame_ts + frame_dur
+    where_kw = _sql_keyword_where("s.name", keywords)
+    q = tp.query(f"""
+        SELECT s.ts, s.dur, s.name
+        FROM slice s
+        WHERE s.ts >= {frame_ts}
+          AND s.ts <= {frame_end}
+          AND s.dur > 0
+          AND ({where_kw})
+        ORDER BY s.dur DESC
+        LIMIT 1
+    """)
+    rows = list(q)
+    if rows:
+        return int(rows[0].ts)
+    return int(frame_ts)
+
+
+def _collect_evidence(tp, start_ts, end_ts, keywords):
+    where_kw = _sql_keyword_where("s.name", keywords)
+    q = tp.query(f"""
+        SELECT
+            s.name as slice_name,
+            s.ts as ts,
+            s.dur as dur,
+            t.name as thread_name,
+            t.tid as tid
+        FROM slice s
+        LEFT JOIN thread_track tt ON s.track_id = tt.id
+        LEFT JOIN thread t ON tt.utid = t.utid
+        WHERE s.ts >= {start_ts}
+          AND s.ts <= {end_ts}
+          AND s.dur > 0
+          AND ({where_kw})
+        ORDER BY s.dur DESC
+        LIMIT 8
+    """)
+    out = []
+    for r in q:
+        out.append(
+            {
+                "name": r.slice_name,
+                "ts": int(r.ts),
+                "dur_ns": int(r.dur),
+                "dur_ms": round(r.dur / 1e6, 3),
+                "thread": r.thread_name or "unknown",
+                "tid": r.tid,
+            }
+        )
+    return out
+
+
+def _sql_keyword_where(field, keywords):
+    parts = []
+    for kw in keywords:
+        safe = kw.replace("'", "''")
+        parts.append(f"{field} LIKE '%{safe}%'")
+    return " OR ".join(parts) if parts else "1=1"
+
+
+def _build_problem_description(frame):
+    evidence = frame.get("evidence_slices", [])
+    first = evidence[0] if evidence else None
+    ev_text = (
+        f"关键证据为 {first['name']}@{first['thread']}，耗时 {first['dur_ms']}ms"
+        if first
+        else "未命中明确证据 slice，按帧内主时段定位"
+    )
+    rr = frame.get("region_range", {})
+    return (
+        f"问题类型为 {frame['jank_type']}，对应帧 #{frame['id']}，"
+        f"目标时刻 target_ts={frame.get('target_ts')}ns，"
+        f"检索窗口 {rr.get('window_ms', 0)}ms，"
+        f"命中关键词 {', '.join(frame.get('keywords_hit', [])) or '无'}。"
+        f"{ev_text}。"
+    )
+
+
+def _build_screenshot_reasoning(frame):
+    focus = frame.get("focus_track", "Actual Timeline")
+    rr = frame.get("region_range", {})
+    return (
+        f"全局图用于展示完整时间窗中的帧分布与上下文，"
+        f"细节图围绕 target_ts={frame.get('target_ts')}ns 收敛，"
+        f"并优先聚焦轨道 {focus}。"
+        f"该轨道在 {rr.get('window_ms', 0)}ms 区间内包含问题关键证据，"
+        f"可直接观察故障点前后的时序与阻塞来源。"
+    )
 
 
 def _build_pin_patterns(target, app_main, app_render, sf_main_tid, sf_pid,
