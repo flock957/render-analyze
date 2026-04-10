@@ -37,6 +37,11 @@ venv 安装说明。
 
 若进程名在 `process` 表中为 NULL（部分 trace 主线程 name 和进程 name 分离存放），则自动用主线程 name 代替，避免 NULL 导致错误匹配或空目标。
 
+> **与截图阶段的关联**：`target_process` 的进程名用于 Phase 2 的 `ExpandTracksByRegex`，
+> 展开目标 App 的进程组。RenderThread 位于该进程的 "Frame Timeline" 子组内，
+> 需要额外 `ExpandTracksByRegex("Expected Timeline|Actual Timeline")` 才能可见
+> （详见 capture-screenshots.md 的 8 步截图策略）。
+
 ## 证据增补（v4.0）
 
 对 `app_jank.json` 的 `top_frames` 每一项，在 SQL 查询后自动增补以下字段：

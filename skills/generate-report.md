@@ -32,7 +32,7 @@ python3 scripts/generate_report.py \
 | Top 问题帧表 | 该类型 top-3 帧的 Frame ID / 耗时 / 类型 | `app_jank.json → type_details` |
 | **问题帧元数据** | 问题类型、帧号、捷区范围、目标时刻、焦点轨道、命中关键词、问题描述、截图逻辑 | `app_jank.json → top_frames` |
 | **证据 slices 表** | Top-5 slice 名 + 线程 + 耗时 + 起点 ts | `app_jank.json → evidence_slices` |
-| **全局图 + 细节图** | 竖屏长图（2144×3196px），base64 内嵌，点击放大 | `screenshots/` |
+| **全局图 + 细节图** | 竖屏长图（2144×3196px），base64 内嵌，点击放大；7 层画面：SF(L5)+HWC(L7) pinned 顶部，Expected/Actual Timeline 中部，App main(L1)+RenderThread(L2)+GPU(L3) 底部 | `screenshots/` |
 | **截图复盘说明** | 蓝色 callout，说明为什么截取这个区域 | `screenshot_reasoning` |
 | **Framework 根因分析** | 调用链 → 源码引用 → Trace 诊断指南 → 根因 → 优化建议 | `FRAMEWORK_KB` 硬编码 |
 

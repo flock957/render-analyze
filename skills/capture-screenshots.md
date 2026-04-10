@@ -33,30 +33,72 @@ python3 scripts/capture_screenshots.py \
 - `device_scale_factor=2.0` → 实际像素 `2144×3196`，提升文字与 slice 细节清晰度
 - 自动裁剪：检测 pinned tracks 底部边界，裁掉空白区域
 
-### Pin 策略（v4.0）
+### 8 步截图策略（v4.1 - 验证通过）
 
-按渲染管线顺序 pin，**主线程 (pos 2) 和 RenderThread (pos 3) 始终紧跟 Timeline 之后**，hwuiTask0/1 与 GPU completion 动态发现后在 pos 4-5：
+每个 jank 帧执行以下 8 步，产出全局图 + 细节图共 2 张：
 
-| 位置 | Track | 说明 |
-|------|-------|------|
-| 1 | Expected/Actual Timeline | 帧 jank 红绿标记 |
-| 2 | App 主线程 | UI Thread，始终 |
-| 3 | App RenderThread | 始终 |
-| 4 | App hwuiTask0/1 | 动态发现 |
-| 5 | App GPU completion | 动态发现 |
-| 6 | SF 主线程 | surfaceflinger |
-| 7 | SF RenderEngine | GPU 合成 |
-| 8 | SF GPU completion | |
-| 9 | SF binder | 最活跃的 |
-| 10 | HWC/Composer | |
-| 11 | CrtcCommit | 显示提交 |
+```
+步骤 1  Reset
+        UnpinAll → CollapseAll
+        清空上一帧的 pin 状态和展开状态
+
+步骤 2  建立所有 track 的 DOM 节点
+        ExpandAllGroups → CollapseAllGroups
+        Perfetto 使用虚拟化滚动，屏幕外 track 无 DOM 节点；
+        ExpandAll 强制把全部节点写入 DOM，CollapseAll 还原折叠状态
+
+步骤 3  Pin 精简顶层管线
+        PinTracksByRegex("surfaceflinger {tid}")
+        PinTracksByRegex("composer-servic")
+        【关键限制】PinTracksByRegex 只移动「顶层」track 到 pinned 区域；
+        进程内部的 main thread / RenderThread 不是顶层 track，无法被 pin。
+        因此只 pin 2 条可用的顶层 track（SF + HWC），保持 pinned 区域紧凑。
+
+步骤 4  Expand 目标进程 + Frame Timeline 子组
+        ExpandTracksByRegex("{进程名}")
+        ExpandTracksByRegex("Expected Timeline|Actual Timeline")
+        【关键发现】RenderThread 在进程的 "Frame Timeline" 子组内，
+        而非普通线程列表；ExpandTracksByRegex 进程名只展开常规 50+ 线程，
+        必须额外 Expand Frame Timeline 子组才能看到 RenderThread DrawFrames。
+
+步骤 5  Collapse 噪声轨道
+        CollapseTracksByRegex("CPU Scheduling|CPU Frequency|Ftrace|GPU|Scheduler|System|Kernel")
+        减少画面干扰，让目标 track 占据更多垂直空间
+
+步骤 6  隐藏 UI 面板
+        ToggleLeftSidebar（隐藏左侧栏）
+        ToggleDrawer（关闭底部 Current Selection 面板）
+        CSS 注入隐藏 cookie/consent 横幅
+
+步骤 7  全局图
+        setVisibleWindow(trace_start, trace_end)
+        omnibox 搜索 "DrawFrames"
+        【目的】omnibox 会导航到 Frame Timeline 子组内的 RenderThread，
+        解决虚拟化滚动导致目标 track 不在视口内的问题
+        截图 → 保存当前 scrollTop（供细节图恢复）
+
+步骤 8  细节图
+        setVisibleWindow(target_ts ± max(2×dur, 80ms))
+        【注意】zoom 操作会重置滚动位置，必须从步骤 7 保存的 scrollTop 还原
+        restore scrollTop → page.mouse.click 在 target_ts 点选 slice
+        截图后 Pillow 叠加标注
+```
+
+### Pin 策略说明（v4.1 vs v4.0 对比）
+
+| 维度 | v4.0（旧） | v4.1（当前） |
+|------|-----------|-------------|
+| Pin 数量 | 最多 11 条（含 App main thread / RenderThread） | 仅 2 条（SF + HWC 顶层 track） |
+| App 层显示方式 | 通过 pin 移到顶部 | 通过 Expand 展开进程组 |
+| Frame Timeline 可见性 | ExpandTracksByRegex(进程名) | 额外 ExpandTracksByRegex("Expected Timeline\|Actual Timeline") |
+| 原因 | 误以为 PinByRegex 能 pin 进程内部 track | PinByRegex 只对顶层 track 有效 |
 
 ### 两类截图（每个问题固定两张）
 
-| 类型 | Zoom 范围 | CollapseAll | 额外操作 | 目的 |
-|------|-----------|-------------|----------|------|
-| 全局图 global | `setVisibleWindow(trace_start, trace_dur)` | 是（保证整洁） | — | 看整段 Trace 的全局分布与上下文 |
-| 细节图 detail | `target_ts ± window` | 否 | App Deadline / Buffer Stuffing 时 `ExpandTracksByRegex(RenderThread)` | 点选证据 slice，打出故障点 |
+| 类型 | Zoom 范围 | 关键步骤 | 目的 |
+|------|-----------|----------|------|
+| **全局图 global** | `setVisibleWindow(trace_start, trace_end)` | omnibox 搜索 "DrawFrames" 导航到 RenderThread | 看整段 Trace 的全局分布与上下文 |
+| **细节图 detail** | `target_ts ± max(2×dur, 80ms)` | 恢复全局图的 scrollTop → clickSliceAt(target_ts) | 点选证据 slice，打出故障点 |
 
 ### Pillow 标注（detail 图）
 
@@ -65,6 +107,18 @@ python3 scripts/capture_screenshots.py \
 - **顶部标题条**：显示 `问题类型 | 证据 slice 名 | 耗时`
 
 标注位置基于 `target_ts` 相对于 visible window 的比例计算，**100% 确定性**，不依赖 Perfetto UI 坐标系。
+
+### 7 层画面组成（从上到下）
+
+| 层 | Track | 说明 |
+|----|-------|------|
+| Pinned-L5 | `surfaceflinger {tid}` | SF 主线程，顶层 track |
+| Pinned-L7 | `composer-servic` | HWC 硬件合成器，顶层 track |
+| Middle | `Expected Timeline` | 帧 jank 绿色/红色标记 |
+| Middle | `Actual Timeline` | 实际帧完成时间 |
+| Bottom-L1 | App 主线程 | UI Thread（doFrame / performTraversals） |
+| Bottom-L2 | `RenderThread` | HWUI 渲染线程（DrawFrames / flush commands） |
+| Bottom-L3 | GPU completion | GPU 完成信号 |
 
 ## Perfetto API 使用
 
@@ -79,14 +133,23 @@ python3 scripts/capture_screenshots.py \
 | Drawer | `dev.perfetto.ToggleDrawer` |
 | Zoom | `app._activeTrace.timeline.setVisibleWindow(HPTS(HPT(BigInt(ns)), dur_ns))` |
 
-## 每个问题的截图流程
+## 每个问题的截图流程（v4.1 - 8 步）
 
-1. UnpinAll + CollapseAll + CloseDrawer + ClearSearch
-2. ExpandTracksByRegex 展开目标进程组 + SF 进程组
-3. Pin 渲染管线 tracks（来自 thread_map.json 的 pin_patterns，含 hwuiTask + GPU completion）
-4. CollapseAll（pinned tracks 保持在顶部）
-5. **全局图**: `setVisibleWindow(trace_start, trace_dur)`，关闭 drawer，截图
-6. **细节图**: 收敛到 `target_ts ± window`；若 jank 类型为 App Deadline Missed 或 Buffer Stuffing，先 `ExpandTracksByRegex(RenderThread)` 展开 RT 子轨道；执行 `clickSliceAt(target_ts)` 点选证据 slice；截图后用 Pillow 标注
+1. **Reset**: UnpinAll → CollapseAll
+2. **建立节点**: ExpandAllGroups → CollapseAllGroups（解决虚拟化滚动 DOM 缺失）
+3. **Pin 顶层 2 条**: `surfaceflinger {tid}` + `composer-servic`
+4. **Expand**: 目标进程名（展开常规线程）+ `"Expected Timeline|Actual Timeline"`（展开 Frame Timeline 子组，使 RenderThread 可见）
+5. **Collapse 噪声**: `CPU Scheduling|CPU Frequency|Ftrace|GPU|Scheduler|System|Kernel`
+6. **隐藏 UI**: ToggleLeftSidebar + ToggleDrawer + CSS 注入隐藏 cookie 横幅
+7. **全局图**: `setVisibleWindow(trace_start, trace_end)` → omnibox 搜索 "DrawFrames" → 截图 → 保存 scrollTop
+8. **细节图**: `setVisibleWindow(target_ts ± window)` → 恢复 scrollTop → `clickSliceAt(target_ts)` → 截图 → Pillow 标注
+
+> **为什么步骤 7 用 omnibox 搜索？** Perfetto 虚拟化滚动导致 RenderThread 在全局视图
+> 下不在视口内，omnibox 搜索 "DrawFrames" 会自动导航到 Frame Timeline 子组中的
+> RenderThread，无需手动滚动。
+>
+> **为什么步骤 8 要恢复 scrollTop？** `setVisibleWindow` 改变 zoom 后 Perfetto 会
+> 重置滚动到顶部，必须手动还原步骤 7 保存的位置，否则细节图看不到目标 track。
 
 ## 截图复盘（设计原则）
 

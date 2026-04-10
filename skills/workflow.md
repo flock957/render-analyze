@@ -57,16 +57,51 @@ python3 scripts/run_workflow.py \
 - Headless Chromium 打开 ui.perfetto.dev 加载 trace
 - **竖屏长图**：viewport `1072×1598` + `device_scale_factor=2.0`
   → 实际像素 `2144×3196`，slice 文字清晰可读
-- Pin 完整渲染管线 track（最多 11 条），详见 Pin 策略
-- 全局图使用 `CollapseAll` 保证画面整洁；细节图在 App Deadline Missed / Buffer Stuffing 类型时额外 `ExpandTracksByRegex(RenderThread)` 以展开 RT 子轨道
-- 每个问题输出 **2 张竖屏长图**：
-  - **全局图 (global)**: `setVisibleWindow(trace_start, trace_end)` — 完整 trace 时间窗
-  - **局部细节图 (detail)**: `target_ts ± max(2×dur, 80ms)` 收敛时间窗 +
-    `page.mouse.click` 在 target_ts 位置点选 slice 打出证据
-- **detail 截图叠加 Pillow 标注**：在 target_ts 对应 x 区域画红色半透明高亮列 +
-  顶部标题条（问题类型 + 证据 slice 名 + 耗时）
-- 画面组成（从上到下）：pinned tracks → collapsed 进程组 → Ftrace Events 证据面板
+- 每个问题输出 **2 张竖屏长图**（全局图 + 细节图）
 - 输出: `screenshots/` 目录 + `screenshot_manifest.json`
+
+#### 8 步截图策略（每个 jank 帧执行一次）
+
+```
+1. Reset:         UnpinAll → CollapseAll
+2. 建立节点:      ExpandAllGroups → CollapseAllGroups
+                  （使所有 track 节点进入 DOM，解决虚拟化滚动导致节点缺失的问题）
+3. Pin 精简管线:  surfaceflinger {tid} + composer-servic
+                  （仅 pin 2 条顶层 track，保持 pinned 区域紧凑）
+4. Expand 目标:   ExpandTracksByRegex(进程名) — 展开目标进程组
+                  ExpandTracksByRegex("Expected Timeline|Actual Timeline") — 展开 Frame Timeline 子组
+5. Collapse 噪声: CollapseTracksByRegex("CPU Scheduling|CPU Frequency|Ftrace|GPU|Scheduler|System|Kernel")
+6. Force-hide UI: ToggleLeftSidebar（隐藏侧栏）+ ToggleDrawer（隐藏 Current Selection 面板）
+                  + CSS 注入隐藏 cookie/cookie-consent 横幅
+7. 全局图:        setVisibleWindow(trace_start, trace_end) → omnibox 搜索 "DrawFrames"
+                  （导航到 Frame Timeline 子组内的 RenderThread，避免虚拟化滚动导致轨道不可见）
+                  → 全视口截图，保存当前滚动位置
+8. 细节图:        setVisibleWindow(target_ts ± window) → 从全局图恢复滚动位置
+                  （zoom 会重置滚动，必须从全局步骤保存的位置还原）
+                  → page.mouse.click 在 target_ts 点选 slice → Pillow 叠加标注
+```
+
+#### 关键发现（可复现性说明）
+
+| 发现 | 影响 | 解决方案 |
+|------|------|----------|
+| `PinTracksByRegex` 只移动**顶层** track 到 pinned 区域 | 进程内部的 main thread / RenderThread 无法通过 pin 显示在顶部 | 改为 pin `surfaceflinger {tid}` + `composer-servic` 2 条顶层 track；App 层通过 Expand 展开 |
+| RenderThread 在进程的 **Frame Timeline 子组**内，不在普通线程列表里 | `ExpandTracksByRegex(进程名)` 只展开常规 50+ 线程，看不到 RenderThread | 额外 `ExpandTracksByRegex("Expected Timeline\|Actual Timeline")` 展开 Frame Timeline 子组 |
+| Perfetto 使用**虚拟化滚动** — 屏幕外 track 无 DOM 节点 | 直接 pin 进程内部 track 时找不到节点 | `ExpandAllGroups → CollapseAllGroups` 强制建立所有 track 的 DOM 节点 |
+| omnibox 搜索 "DrawFrames" 导航到 Frame Timeline 内的 RenderThread | 可以跳转到正确的 y 位置 | 全局图步骤用 omnibox 搜索代替手动滚动 |
+| zoom 操作会重置滚动位置 | detail 图 zoom 后滚动位置丢失 | 全局图截图后保存 `scrollTop`，detail 步骤 zoom 后还原 |
+
+#### 7 层画面组成（从上到下）
+
+| 层 | Track | 说明 |
+|----|-------|------|
+| Pinned-L5 | `surfaceflinger {tid}` | SF 主线程，顶层 track |
+| Pinned-L7 | `composer-servic` | HWC 硬件合成器，顶层 track |
+| Middle | `Expected Timeline` | 帧 jank 绿色/红色标记 |
+| Middle | `Actual Timeline` | 实际帧完成标记 |
+| Bottom-L1 | App 主线程 | UI Thread（doFrame / performTraversals） |
+| Bottom-L2 | `RenderThread` | HWUI 渲染线程（DrawFrames / flush commands） |
+| Bottom-L3 | GPU completion | GPU 完成信号 |
 
 ### Phase 3: Generate Report (`generate_report.py`)
 - 生成 HTML 报告，内嵌 base64 截图
@@ -108,21 +143,19 @@ python3 scripts/run_workflow.py \
 | Drawer toggle | `dev.perfetto.ToggleDrawer` | 关闭底部 Found Events 面板 |
 | Zoom | `app._activeTrace.timeline.setVisibleWindow(HPTS(HPT(BigInt), dur))` | HPT/HPTS 从 visibleWindow 获取构造函数 |
 
-## Pin 策略（v4.0 - 完整渲染管线）
+## Pin 策略（v4.1 - 精简顶层 Pin + Expand Frame Timeline）
 
-按渲染管线分层 pin，顺序从上到下。**主线程 (pos 2) 和 RenderThread (pos 3) 始终紧跟 Timeline 之后被 pin**，hwuiTask0/1 和 GPU completion 动态发现后 pin 在 pos 4-5。
+`PinTracksByRegex` **只能把顶层 track 移到 pinned 区域**，进程内部线程（main thread / RenderThread）无法通过 pin 显示在顶部。因此当前策略改为：只 pin 2 条顶层 track，App 层 track 通过 Expand 展开可见。
 
-| 层级 | Pin 模式示例 | 说明 |
-|------|-------------|------|
-| 1. Frame Timeline | `Expected Timeline` / `Actual Timeline` | 帧 jank 红绿指示器 |
-| 2. App 主线程 | `droid.ugc.aweme 10269` | UI Thread；始终第 2 位 |
-| 3. App RenderThread | `RenderThread {tid}` | 精确 tid；始终第 3 位 |
-| 4-5. hwuiTask / GPU | `hwuiTask0 {tid}` / `GPU completion {tid}` | 动态发现并 pin |
-| 6. SF 主线程 | `surfaceflinger 1388` | tid = pid |
-| 7. SF RenderEngine | `RenderEngine {tid}` | GPU 合成引擎 |
-| 8. SF GPU completion | `GPU completion {tid}` | SF 侧 GPU 完成信号 |
-| 9. SF binder | `binder:1388_4` | 最活跃的 binder 线程 |
-| 10. HWC/Composer | `composer-servic` 或 `HWC_UeventThrea` | 硬件合成器 |
-| 11. CrtcCommit | `crtc_commit:113` | 显示提交内核线程 |
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| Pin L5 | `surfaceflinger {tid}` | SF 主线程，顶层 track，可被 pin |
+| Pin L7 | `composer-servic` | HWC 硬件合成器，顶层 track，可被 pin |
+| Expand | 目标进程名 regex | 展开目标 App 进程组（常规线程） |
+| Expand | `Expected Timeline\|Actual Timeline` | 展开 Frame Timeline 子组（含 RenderThread DrawFrames） |
+| Collapse | CPU/GPU/Ftrace/Kernel 等噪声 track | 减少画面干扰 |
 
-所有 pin_patterns 由 `analyze_jank.py` 的 `thread_map.json` 自动生成。
+App 层的 RenderThread 在 **Frame Timeline 子组**内（非常规线程列表），必须单独 ExpandTracksByRegex("Expected Timeline|Actual Timeline") 才能展开。
+
+> **注意：** `thread_map.json` 的 `pin_patterns` 字段仍保留完整管线（11 条）用于报告元数据，
+> 实际截图只 pin 2 条（SF + HWC）。
