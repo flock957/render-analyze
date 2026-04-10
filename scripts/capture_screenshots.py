@@ -182,73 +182,77 @@ def main():
 
                 print(f"\n  [2.4.{i+1}] [{i+1}/{len(top_frames)}] {jank_type} ({dur_ms:.1f}ms)")
 
-                # Reset: unpin, collapse, close drawer, clear search
+                target_ts = int(frame.get("target_ts", ts))
+                focus_track = frame.get("focus_track", "Actual Timeline")
+
+                # ── GLOBAL screenshot ────────────────────────────
+                # Collapse all, expand only target + SF, zoom full trace
                 _cmd(page, 'dev.perfetto.UnpinAllTracks')
                 _cmd(page, 'dev.perfetto.CollapseAllGroups')
                 _close_drawer(page)
                 _clear_search(page)
                 time.sleep(0.3)
 
-                # Expand target process + SF groups so their children are pinnable
+                # Expand target process and SF so their tracks are visible
                 _cmd(page, 'dev.perfetto.ExpandTracksByRegex', target['process_name'])
+                time.sleep(0.3)
+                _cmd(page, 'dev.perfetto.ExpandTracksByRegex', str(target['pid']))
                 time.sleep(0.3)
                 _cmd(page, 'dev.perfetto.ExpandTracksByRegex', 'surfaceflinger')
                 time.sleep(0.3)
 
-                # Pin all rendering pipeline tracks (order matters for top-to-bottom layout)
-                for pat in pin_patterns:
-                    _cmd(page, 'dev.perfetto.PinTracksByRegex', pat)
-                    time.sleep(0.2)
-
-                # Dismiss any lingering omnibox/track-path dialog left by pin commands
-                page.keyboard.press("Escape")
-                time.sleep(0.2)
-                page.keyboard.press("Escape")
-                time.sleep(0.2)
-
-                # Collapse all non-pinned tracks (pinned stay at top)
-                _cmd(page, 'dev.perfetto.CollapseAllGroups')
-                time.sleep(0.3)
-
-                target_ts = int(frame.get("target_ts", ts))
-                focus_track = frame.get("focus_track", "Actual Timeline")
-
-                # === Global screenshot (full trace window) ===
-                _cmd(page, 'dev.perfetto.CollapseAllGroups')
-                time.sleep(0.2)
+                # Zoom to full trace window
                 global_start = int(tp_state["trace_start"])
                 global_end = int(tp_state["trace_end"])
                 _zoom_to(page, global_start, global_end)
                 time.sleep(1.5)
-                _dismiss_cookie(page)
-                _close_drawer(page)
-                _hide_drawer_and_cookies(page)
 
+                # Scroll to target process area
+                _scroll_to_track(page, target['process_name'])
+                time.sleep(0.5)
+
+                _dismiss_cookie(page)
+                _collapse_bottom_panel(page)
+                page.keyboard.press("Escape")
+                time.sleep(0.3)
+
+                # Clip screenshot: find canvas area, capture from target process region
                 global_file = f"{i:02d}_{safe_name}_global.png"
-                _take_screenshot(page, output / global_file)
+                _take_clipped_screenshot(page, output / global_file, target['process_name'])
                 print(f"         -> {global_file}")
 
-                # === Detail screenshot: target_ts-centered + click evidence slice ===
+                # ── DETAIL screenshot ────────────────────────────
+                # Zoom to target_ts region
                 detail_window = max(int(dur * 2), 80_000_000)
                 detail_start = target_ts - detail_window
                 detail_end = target_ts + detail_window
                 _zoom_to(page, detail_start, detail_end)
                 time.sleep(1.0)
-                # Expand RenderThread and main thread for deep slice visibility
+
+                # Expand target process tracks for detail view
+                _cmd(page, 'dev.perfetto.ExpandTracksByRegex', target['process_name'])
+                time.sleep(0.3)
+                _cmd(page, 'dev.perfetto.ExpandTracksByRegex', str(target['pid']))
+                time.sleep(0.3)
                 if "App Deadline" in jank_type or "Buffer Stuffing" in jank_type:
                     _cmd(page, 'dev.perfetto.ExpandTracksByRegex', 'RenderThread')
                     time.sleep(0.3)
-                    _cmd(page, 'dev.perfetto.ExpandTracksByRegex', target['process_name'])
-                    time.sleep(0.3)
-                _focus_track_y(page, focus_track)
+
+                # Scroll to focus track + click slice for evidence
+                _scroll_to_track(page, focus_track)
+                time.sleep(0.3)
                 _click_slice_at(page, target_ts, detail_start, detail_end)
                 time.sleep(0.4)
-                _dismiss_cookie(page)
-                _close_drawer(page)
-                _hide_drawer_and_cookies(page)
 
+                _dismiss_cookie(page)
+                _collapse_bottom_panel(page)
+                page.keyboard.press("Escape")
+                time.sleep(0.3)
+
+                # Clip screenshot centered on focus track area
                 detail_file = f"{i:02d}_{safe_name}_detail.png"
-                _take_screenshot(page, output / detail_file)
+                _take_clipped_screenshot(page, output / detail_file, focus_track)
+
                 # Annotate with highlight box + title bar
                 evidence = frame.get("evidence_slices", [])
                 _annotate_detail(
@@ -460,12 +464,57 @@ def _clear_search(page):
     except: pass
 
 
-def _hide_drawer_and_cookies(page):
-    """Hide the bottom drawer panel and any cookie banners.
+def _collapse_bottom_panel(page):
+    """Collapse the 'Current Selection' / 'Ftrace Events' bottom panel.
 
-    Uses only narrow, well-known selectors so we don't accidentally hide the
-    pinned tracks or main scroll container.
+    Clicks the downward arrow button in the tab strip to minimize the panel,
+    then hides any remaining panel elements via CSS as a fallback.
     """
+    try:
+        # Strategy 1: Click the minimize/collapse button (downward arrow)
+        page.evaluate("""
+            (() => {
+                // Look for buttons/icons near the bottom tab strip
+                const btns = document.querySelectorAll(
+                    'button, [role="button"], [class*="icon"], [class*="btn"]'
+                );
+                for (const btn of btns) {
+                    const r = btn.getBoundingClientRect();
+                    // Bottom-right area, small button
+                    if (r.top > window.innerHeight * 0.6 && r.width < 60 && r.height < 60) {
+                        const title = (btn.title || btn.getAttribute('aria-label') || '').toLowerCase();
+                        const cls = (btn.className || '').toLowerCase();
+                        if (title.includes('close') || title.includes('minim') || title.includes('hide')
+                            || title.includes('collapse') || cls.includes('close') || cls.includes('minim')) {
+                            btn.click();
+                            return 'clicked-' + (title || cls);
+                        }
+                    }
+                }
+                // Strategy 2: Find tab handles and hide the panel below them
+                const tabHandles = document.querySelectorAll(
+                    '[class*="tab-handle"], [class*="tabHandle"], [class*="handle-bar"]'
+                );
+                for (const h of tabHandles) {
+                    const r = h.getBoundingClientRect();
+                    if (r.top > window.innerHeight * 0.5) {
+                        // Hide everything below this handle
+                        let sibling = h.nextElementSibling;
+                        while (sibling) {
+                            sibling.style.display = 'none';
+                            sibling = sibling.nextElementSibling;
+                        }
+                        return 'hidden-siblings';
+                    }
+                }
+                return 'no-panel-found';
+            })()
+        """)
+        time.sleep(0.3)
+    except:
+        pass
+
+    # Strategy 3: CSS fallback — hide known bottom panel selectors
     try:
         page.evaluate("""
             (() => {
@@ -477,6 +526,18 @@ def _hide_drawer_and_cookies(page):
                 document.querySelectorAll(drawerSelectors.join(',')).forEach(el => {
                     try { el.style.display = 'none'; } catch(e) {}
                 });
+            })()
+        """)
+    except:
+        pass
+
+
+def _hide_drawer_and_cookies(page):
+    """Collapse the bottom panel and remove cookie banners before screenshot."""
+    _collapse_bottom_panel(page)
+    try:
+        page.evaluate("""
+            (() => {
 
                 document.querySelectorAll(
                     '[class*="cookie"], [id*="cookie"], [class*="consent"]'
@@ -563,89 +624,194 @@ def _click_slice_at(page, target_ts, vis_start_ns, vis_end_ns):
 
 
 def _annotate_detail(filepath, target_ts, vis_start, vis_end, jank_type, evidence):
-    """Overlay a translucent highlight column + title bar on detail screenshot.
+    """Overlay a bounded highlight rectangle + title bar on detail screenshot.
 
-    The highlight marks the x-region around target_ts so the reader's eye is
-    immediately drawn to the evidence area. A small title bar at the top shows
-    the jank type and top evidence slice.
+    The rectangle has clear top/bottom/left/right borders covering the pinned
+    tracks area (roughly top 40% of the image) at the x-position of target_ts.
     """
     try:
         from PIL import Image, ImageDraw, ImageFont
     except ImportError:
-        return  # Pillow not installed — skip silently
+        return
 
     try:
         img = Image.open(str(filepath)).convert("RGBA")
         w, h = img.size
 
-        # Compute x-range for the highlight (target_ts ± 5% of visible window)
         if vis_end <= vis_start:
             return
         ts_ratio = (int(target_ts) - int(vis_start)) / (int(vis_end) - int(vis_start))
         ts_ratio = max(0.02, min(0.98, ts_ratio))
-        # Track area starts after the left label gutter (~18% of width)
+
+        # Track area: after left label gutter (~18% of width)
         gutter = int(w * 0.18)
         track_w = w - gutter
         center_x = gutter + int(track_w * ts_ratio)
-        half_w = max(int(track_w * 0.05), 40)  # 5% of track width, min 40px
+        half_w = max(int(track_w * 0.06), 50)
 
         x_left = max(gutter, center_x - half_w)
-        x_right = min(w, center_x + half_w)
+        x_right = min(w - 10, center_x + half_w)
 
-        # Draw translucent red column over the full height (skip top 60px header)
+        # Bounded rectangle: top = below title bar, bottom = ~45% of image height
+        # This covers the pinned tracks area without extending to collapsed groups
+        bar_h = 40
+        rect_top = bar_h + 10
+        rect_bottom = int(h * 0.45)
+
         overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
+
+        # Semi-transparent fill + solid red border (all 4 sides)
         draw.rectangle(
-            [x_left, 60, x_right, h - 20],
-            fill=(255, 60, 60, 35),       # very light red tint
-            outline=(255, 60, 60, 180),   # red border
-            width=2,
+            [x_left, rect_top, x_right, rect_bottom],
+            fill=(255, 50, 50, 30),
+            outline=(255, 60, 60, 200),
+            width=3,
         )
 
-        # Title bar at top
+        # Corner markers for emphasis (short thick lines at each corner)
+        corner_len = 20
+        corner_w = 4
+        red = (255, 40, 40, 230)
+        for cx, cy in [(x_left, rect_top), (x_right, rect_top),
+                       (x_left, rect_bottom), (x_right, rect_bottom)]:
+            dx = corner_len if cx == x_left else -corner_len
+            dy = corner_len if cy == rect_top else -corner_len
+            draw.line([(cx, cy), (cx + dx, cy)], fill=red, width=corner_w)
+            draw.line([(cx, cy), (cx, cy + dy)], fill=red, width=corner_w)
+
+        # Title bar at very top
         top_ev = evidence[0] if evidence else None
         if top_ev:
             title = f"{jank_type}  |  {top_ev['name']}@{top_ev['thread']} ({top_ev['dur_ms']}ms)"
         else:
             title = jank_type
-        # Truncate if too long
-        title = title[:100]
+        title = title[:120]
 
-        # Draw title background
-        bar_h = 36
-        draw.rectangle([0, 0, w, bar_h], fill=(30, 30, 30, 220))
-
-        # Draw title text
+        draw.rectangle([0, 0, w, bar_h], fill=(20, 20, 20, 210))
         try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 20)
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 22)
         except Exception:
             font = ImageFont.load_default()
-        draw.text((12, 8), title, fill=(255, 200, 200, 255), font=font)
+        draw.text((14, 9), title, fill=(255, 200, 200, 255), font=font)
 
-        # Small "target_ts" label near the highlight
-        ts_label = f"target_ts"
+        # Label below the box
         try:
-            small_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
+            small_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
         except Exception:
             small_font = font
-        label_x = max(gutter, center_x - 40)
-        draw.text((label_x, bar_h + 4), ts_label, fill=(255, 100, 100, 200), font=small_font)
+        label = "target_ts focus"
+        label_x = max(gutter, center_x - 60)
+        draw.text((label_x, rect_bottom + 6), label, fill=(255, 80, 80, 200), font=small_font)
 
-        # Composite and save
         result = Image.alpha_composite(img, overlay)
         result.convert("RGB").save(str(filepath))
     except Exception as e:
         print(f"         [annotate] {e}")
 
 
-def _take_screenshot(page, filepath):
-    """Take a full portrait viewport screenshot.
+def _scroll_to_track(page, track_name):
+    """Scroll the Perfetto UI so that a track matching track_name is visible.
 
-    The viewport is intentionally fixed to a tall portrait shape (1072x1598)
-    so a single page.screenshot already crops one large vertical region.
-    No further cropping is applied — the bottom portion (collapsed group
-    labels) is kept on purpose as visual context.
+    Uses Perfetto's internal search or DOM text matching to find the track,
+    then scrolls it into view at the upper portion of the viewport.
     """
+    if not track_name:
+        return
+    try:
+        page.evaluate("""(name) => {
+            const needle = name.toLowerCase();
+            // Search through all elements that look like track labels
+            const candidates = document.querySelectorAll(
+                '[class*="track"] [class*="title"], [class*="track"] [class*="name"],' +
+                '[class*="shell"], [class*="pf-track"], [class*="trackShell"]'
+            );
+            for (const el of candidates) {
+                const text = (el.textContent || '').trim().toLowerCase();
+                if (text && text.includes(needle)) {
+                    // Scroll the track into view — aim for upper quarter
+                    el.scrollIntoView({block: 'start', behavior: 'instant'});
+                    return true;
+                }
+            }
+            // Fallback: search in all divs/spans with short text
+            const all = document.querySelectorAll('div, span');
+            for (const el of all) {
+                const text = (el.textContent || '').trim().toLowerCase();
+                if (text.length > 2 && text.length < 80 && text.includes(needle)) {
+                    el.scrollIntoView({block: 'start', behavior: 'instant'});
+                    return true;
+                }
+            }
+            return false;
+        }""", track_name)
+    except Exception:
+        pass
+
+
+def _take_clipped_screenshot(page, filepath, anchor_track):
+    """Take a screenshot clipped to the canvas area near anchor_track.
+
+    Strategy (from the reference implementation):
+    1. Find the canvas element's bounding rect (skip left track-label gutter)
+    2. Find the anchor track's y-position
+    3. Clip: x from canvas left, y from slightly above anchor, full canvas width,
+       height = viewport height covering the tracks of interest
+    """
+    try:
+        clip = page.evaluate("""(anchorName) => {
+            const vw = window.innerWidth;
+            const vh = window.innerHeight;
+
+            // Find the main canvas (largest one)
+            let canvas = null;
+            let maxArea = 0;
+            document.querySelectorAll('canvas').forEach(c => {
+                const r = c.getBoundingClientRect();
+                const area = r.width * r.height;
+                if (area > maxArea) { maxArea = area; canvas = c; }
+            });
+
+            // Canvas left edge (this naturally clips out the track label sidebar)
+            let cx = 0, cw = vw;
+            if (canvas) {
+                const cr = canvas.getBoundingClientRect();
+                cx = Math.max(0, Math.floor(cr.x));
+                cw = Math.floor(cr.width);
+            }
+
+            // Find anchor track y-position
+            let anchorY = vh * 0.15;  // default: 15% from top
+            if (anchorName) {
+                const needle = anchorName.toLowerCase();
+                const els = document.querySelectorAll(
+                    '[class*="track"] [class*="title"], [class*="track"] [class*="name"],' +
+                    '[class*="shell"], [class*="pf-track"]'
+                );
+                for (const el of els) {
+                    const text = (el.textContent || '').trim().toLowerCase();
+                    if (text && text.includes(needle)) {
+                        const r = el.getBoundingClientRect();
+                        anchorY = r.top;
+                        break;
+                    }
+                }
+            }
+
+            // Clip region: start a bit above anchor, extend downward
+            const clipY = Math.max(0, Math.floor(anchorY - vh * 0.08));
+            const clipH = Math.min(vh - clipY, Math.floor(vh * 0.85));
+
+            return {x: cx, y: clipY, width: cw, height: clipH};
+        }""", anchor_track)
+
+        if clip and clip.get("width", 0) > 100 and clip.get("height", 0) > 100:
+            page.screenshot(path=str(filepath), clip=clip)
+            return
+    except Exception as e:
+        print(f"         [clip] fallback: {e}")
+
+    # Fallback: full viewport
     page.screenshot(path=str(filepath))
 
 

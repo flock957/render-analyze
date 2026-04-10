@@ -573,25 +573,39 @@ def _build_pin_patterns(target, app_main, app_render, app_hwui,
                         sf_main_tid, sf_pid,
                         sf_render_engine, sf_gpu, sf_binder,
                         hwc_threads, crtc_threads):
-    """Build pin patterns. Order = top to bottom in Perfetto pinned area.
-    App main + RenderThread are always first (after Timeline)."""
+    """Build pin patterns for PinTracksByRegex.
+
+    Perfetto track labels vary — sometimes "ThreadName TID", sometimes just
+    "ThreadName", sometimes the process name. We use multiple fallback patterns
+    per track to maximize match chances. Each pattern is tried in order.
+
+    Order = top to bottom in Perfetto pinned area.
+    App main + RenderThread are always first (after Timeline).
+    """
     patterns = []
 
     # 1. Frame Timeline
     patterns.append("Expected Timeline")
     patterns.append("Actual Timeline")
 
-    # 2. App main thread (most important — right after Timeline)
+    # 2. App main thread — try "name tid" first, then just process name
     if app_main:
         patterns.append(f"{app_main[0]['name']} {app_main[0]['tid']}")
+        # Also try the full process name from target (covers "com.ss.android.ugc.aweme")
+        pname = target.get("process_name", "")
+        if pname and pname != app_main[0]['name']:
+            patterns.append(pname)
 
-    # 3. App RenderThread (second most important)
+    # 3. App RenderThread — try "RenderThread tid", then just "RenderThread"
     if app_render:
         patterns.append(f"RenderThread {app_render[0]['tid']}")
+    # Always try bare "RenderThread" as fallback (may pin multiple RTs, that's OK)
+    patterns.append("RenderThread")
 
-    # 4. App hwuiTask + GPU completion (Skia helpers)
+    # 4. App hwuiTask (try both "name tid" and bare name)
     for t in app_hwui[:2]:
         patterns.append(f"{t['name']} {t['tid']}")
+        patterns.append(t['name'])
 
     # 5. SF main
     if sf_main_tid:
