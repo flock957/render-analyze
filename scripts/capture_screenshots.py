@@ -234,34 +234,41 @@ def main():
                 page.screenshot(path=str(output / global_file))
                 print(f"         -> {global_file}")
 
+                # Save the scroll position from the global (which shows Frame Timeline)
+                saved_scroll = page.evaluate("""(() => {
+                    const panels = document.querySelectorAll(
+                        '[class*="scroll"], [class*="panel-container"], [class*="viewer"]'
+                    );
+                    for (const p of panels) {
+                        if (p.scrollHeight > p.clientHeight && p.clientHeight > 200) {
+                            return {selector: p.className, top: p.scrollTop, height: p.scrollHeight};
+                        }
+                    }
+                    return {top: window.scrollY, height: document.body.scrollHeight};
+                })()""")
+
                 # ── DETAIL screenshot ────────────────────────────
+                # Only zoom — don't redo expand/collapse/search.
                 detail_window = max(int(dur * 2), 80_000_000)
                 detail_start = target_ts - detail_window
                 detail_end = target_ts + detail_window
                 _zoom_to(page, detail_start, detail_end)
-                time.sleep(1.5)
-
-                # ExpandAll so RenderThread (in Frame Timeline sub-group) is visible
-                _cmd(page, 'dev.perfetto.ExpandAllGroups')
                 time.sleep(2)
-                # Collapse system noise
-                for noise in ['CPU Scheduling', 'CPU Frequency', 'Ftrace',
-                              'GPU', 'Scheduler', 'System', 'Kernel']:
-                    _cmd(page, 'dev.perfetto.CollapseTracksByRegex', noise)
-                    time.sleep(0.1)
-                page.keyboard.press("Escape")
-                time.sleep(0.2)
 
-                # Navigate to focus track via omnibox search
-                if "App Deadline" in jank_type or "Buffer" in jank_type:
-                    _search_and_navigate(page, "DrawFrames")
-                elif "SurfaceFlinger" in jank_type:
-                    _search_and_navigate(page, "composite")
-                elif "Display HAL" in jank_type:
-                    _search_and_navigate(page, "present")
-                else:
-                    _search_and_navigate(page, "Choreographer")
-                time.sleep(0.3)
+                # Restore scroll position (zoom may have reset it)
+                page.evaluate(f"""(() => {{
+                    const panels = document.querySelectorAll(
+                        '[class*="scroll"], [class*="panel-container"], [class*="viewer"]'
+                    );
+                    for (const p of panels) {{
+                        if (p.scrollHeight > p.clientHeight && p.clientHeight > 200) {{
+                            p.scrollTop = {saved_scroll.get('top', 0)};
+                            return;
+                        }}
+                    }}
+                    window.scrollTo(0, {saved_scroll.get('top', 0)});
+                }})()""")
+                time.sleep(1)
 
                 # Click slice at target_ts for evidence
                 _click_slice_at(page, target_ts, detail_start, detail_end)
