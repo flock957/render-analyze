@@ -214,6 +214,8 @@ def main():
                 focus_track = frame.get("focus_track", "Actual Timeline")
 
                 # === Global screenshot (full trace window) ===
+                _cmd(page, 'dev.perfetto.CollapseAllGroups')
+                time.sleep(0.2)
                 global_start = int(tp_state["trace_start"])
                 global_end = int(tp_state["trace_end"])
                 _zoom_to(page, global_start, global_end)
@@ -232,6 +234,12 @@ def main():
                 detail_end = target_ts + detail_window
                 _zoom_to(page, detail_start, detail_end)
                 time.sleep(1.0)
+                # Expand RenderThread and main thread for deep slice visibility
+                if "App Deadline" in jank_type or "Buffer Stuffing" in jank_type:
+                    _cmd(page, 'dev.perfetto.ExpandTracksByRegex', 'RenderThread')
+                    time.sleep(0.3)
+                    _cmd(page, 'dev.perfetto.ExpandTracksByRegex', target['process_name'])
+                    time.sleep(0.3)
                 _focus_track_y(page, focus_track)
                 _click_slice_at(page, target_ts, detail_start, detail_end)
                 time.sleep(0.4)
