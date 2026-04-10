@@ -186,14 +186,13 @@ def main():
                 focus_track = frame.get("focus_track", "Actual Timeline")
 
                 # ── GLOBAL screenshot ────────────────────────────
-                # Collapse all, expand only target + SF, zoom full trace
                 _cmd(page, 'dev.perfetto.UnpinAllTracks')
                 _cmd(page, 'dev.perfetto.CollapseAllGroups')
                 _close_drawer(page)
                 _clear_search(page)
                 time.sleep(0.3)
 
-                # Expand target process and SF so their tracks are visible
+                # Expand target process + SF (single pass, no re-collapse)
                 _cmd(page, 'dev.perfetto.ExpandTracksByRegex', target['process_name'])
                 time.sleep(0.3)
                 _cmd(page, 'dev.perfetto.ExpandTracksByRegex', str(target['pid']))
@@ -201,22 +200,20 @@ def main():
                 _cmd(page, 'dev.perfetto.ExpandTracksByRegex', 'surfaceflinger')
                 time.sleep(0.3)
 
-                # Zoom to full trace window
+                # Zoom to full trace and wait for rendering
                 global_start = int(tp_state["trace_start"])
                 global_end = int(tp_state["trace_end"])
                 _zoom_to(page, global_start, global_end)
-                time.sleep(1.5)
+                time.sleep(3)  # longer wait for full-trace rendering
 
                 # Scroll to target process area
                 _scroll_to_track(page, target['process_name'])
                 time.sleep(0.5)
-
                 _dismiss_cookie(page)
                 _collapse_bottom_panel(page)
                 page.keyboard.press("Escape")
                 time.sleep(0.3)
 
-                # Clip screenshot: find canvas area, capture from target process region
                 global_file = f"{i:02d}_{safe_name}_global.png"
                 _take_clipped_screenshot(page, output / global_file, target['process_name'])
                 print(f"         -> {global_file}")
@@ -465,65 +462,56 @@ def _clear_search(page):
 
 
 def _collapse_bottom_panel(page):
-    """Collapse the 'Current Selection' / 'Ftrace Events' bottom panel.
+    """Hide the 'Current Selection' / 'Ftrace Events' bottom panel entirely.
 
-    Clicks the downward arrow button in the tab strip to minimize the panel,
-    then hides any remaining panel elements via CSS as a fallback.
+    Uses a position-based approach: any element whose top edge is in the
+    bottom 35% of the viewport AND contains tab-like text (Current Selection,
+    Ftrace Events, Nothing selected) gets hidden via display:none, along
+    with all its siblings below it.
     """
     try:
-        # Strategy 1: Click the minimize/collapse button (downward arrow)
         page.evaluate("""
             (() => {
-                // Look for buttons/icons near the bottom tab strip
-                const btns = document.querySelectorAll(
-                    'button, [role="button"], [class*="icon"], [class*="btn"]'
-                );
-                for (const btn of btns) {
-                    const r = btn.getBoundingClientRect();
-                    // Bottom-right area, small button
-                    if (r.top > window.innerHeight * 0.6 && r.width < 60 && r.height < 60) {
-                        const title = (btn.title || btn.getAttribute('aria-label') || '').toLowerCase();
-                        const cls = (btn.className || '').toLowerCase();
-                        if (title.includes('close') || title.includes('minim') || title.includes('hide')
-                            || title.includes('collapse') || cls.includes('close') || cls.includes('minim')) {
-                            btn.click();
-                            return 'clicked-' + (title || cls);
-                        }
-                    }
-                }
-                // Strategy 2: Find tab handles and hide the panel below them
-                const tabHandles = document.querySelectorAll(
-                    '[class*="tab-handle"], [class*="tabHandle"], [class*="handle-bar"]'
-                );
-                for (const h of tabHandles) {
-                    const r = h.getBoundingClientRect();
-                    if (r.top > window.innerHeight * 0.5) {
-                        // Hide everything below this handle
-                        let sibling = h.nextElementSibling;
-                        while (sibling) {
-                            sibling.style.display = 'none';
-                            sibling = sibling.nextElementSibling;
-                        }
-                        return 'hidden-siblings';
-                    }
-                }
-                return 'no-panel-found';
-            })()
-        """)
-        time.sleep(0.3)
-    except:
-        pass
+                const vh = window.innerHeight;
+                const threshold = vh * 0.65;
 
-    # Strategy 3: CSS fallback — hide known bottom panel selectors
-    try:
-        page.evaluate("""
-            (() => {
-                const drawerSelectors = [
+                // 1. Hide any element that looks like the bottom panel tab strip
+                //    by checking for characteristic text content
+                const keywords = ['current selection', 'ftrace events', 'nothing selected',
+                                  'selected', 'filter'];
+                document.querySelectorAll('div, section').forEach(el => {
+                    const r = el.getBoundingClientRect();
+                    if (r.top < threshold || r.height < 20 || r.height > vh * 0.5) return;
+                    const text = (el.textContent || '').toLowerCase().trim();
+                    if (text.length > 200) return;
+                    for (const kw of keywords) {
+                        if (text.includes(kw)) {
+                            // Found the panel — hide it and everything below
+                            let node = el;
+                            // Walk up to find the panel container
+                            while (node.parentElement &&
+                                   node.parentElement.getBoundingClientRect().top > threshold) {
+                                node = node.parentElement;
+                            }
+                            node.style.display = 'none';
+                            // Also hide siblings after it
+                            let sib = node.nextElementSibling;
+                            while (sib) {
+                                sib.style.display = 'none';
+                                sib = sib.nextElementSibling;
+                            }
+                            return;
+                        }
+                    }
+                });
+
+                // 2. Fallback: hide by known class selectors
+                const selectors = [
                     '.pf-bottom-panel', '.pf-details-panel',
                     '[class*="bottom-panel"]', '[class*="details-panel"]',
                     '[class*="bottomPanel"]', '[class*="detailsPanel"]'
                 ];
-                document.querySelectorAll(drawerSelectors.join(',')).forEach(el => {
+                document.querySelectorAll(selectors.join(',')).forEach(el => {
                     try { el.style.display = 'none'; } catch(e) {}
                 });
             })()
@@ -581,44 +569,42 @@ def _focus_track_y(page, focus_track):
 def _click_slice_at(page, target_ts, vis_start_ns, vis_end_ns):
     """Click on the canvas at the x-position corresponding to target_ts.
 
-    We compute the click x in CSS pixels using the known visible window range
-    (vis_start_ns, vis_end_ns) and use Playwright's real mouse click so that
-    Perfetto's canvas hit-testing receives proper pointer events.
+    Uses the largest canvas element's bounding rect to calculate the precise
+    click position, then uses Playwright's real mouse click for Perfetto's
+    canvas hit-testing.
     """
     try:
         if vis_end_ns <= vis_start_ns:
             return
         ratio = (int(target_ts) - int(vis_start_ns)) / (int(vis_end_ns) - int(vis_start_ns))
         ratio = max(0.05, min(0.95, ratio))
-        # Discover canvas / track area bounding box (skip the left track-label gutter)
-        bbox = page.evaluate("""
+
+        # Find the largest canvas (the main trace rendering surface)
+        canvas_rect = page.evaluate("""
             (() => {
-                const candidates = document.querySelectorAll(
-                    '[class*="pf-track"], [class*="trackShell"], [class*="track-shell"]'
-                );
                 let best = null;
-                for (const el of candidates) {
-                    const r = el.getBoundingClientRect();
-                    if (r.width > 200 && r.height > 10 && r.top < window.innerHeight) {
-                        if (!best || r.width > best.width) best = {x: r.x, y: r.y, w: r.width, h: r.height};
+                let maxArea = 0;
+                document.querySelectorAll('canvas').forEach(c => {
+                    const r = c.getBoundingClientRect();
+                    const area = r.width * r.height;
+                    if (area > maxArea) {
+                        maxArea = area;
+                        best = {x: r.x, y: r.y, w: r.width, h: r.height};
                     }
-                }
-                if (best) return best;
-                // Fallback: assume the canvas occupies the right 80% of viewport
-                return {x: Math.floor(window.innerWidth * 0.2), y: Math.floor(window.innerHeight * 0.3),
-                        w: Math.floor(window.innerWidth * 0.78), h: Math.floor(window.innerHeight * 0.4)};
+                });
+                return best || {x: 0, y: 0, w: window.innerWidth, h: window.innerHeight};
             })()
         """)
-        if not bbox:
+        if not canvas_rect:
             return
-        # Aim above any left-side label gutter (assume gutter ~ 200px from x)
-        gutter = 200
-        track_x = bbox["x"] + gutter
-        track_w = max(50, bbox["w"] - gutter)
-        click_x = track_x + track_w * ratio
-        click_y = bbox["y"] + bbox["h"] * 0.5
-        page.mouse.move(click_x, click_y)
+
+        # Click at the computed x on the canvas, vertically centered
+        click_x = canvas_rect["x"] + canvas_rect["w"] * ratio
+        click_y = canvas_rect["y"] + canvas_rect["h"] * 0.35  # upper-center of canvas
         page.mouse.click(click_x, click_y)
+        time.sleep(0.2)
+        # Try a second click slightly lower in case first missed
+        page.mouse.click(click_x, click_y + 40)
     except Exception:
         pass
 
@@ -798,9 +784,25 @@ def _take_clipped_screenshot(page, filepath, anchor_track):
                 }
             }
 
-            // Clip region: start a bit above anchor, extend downward
+            // Detect bottom panel top edge (to exclude from clip)
+            let panelTop = vh;
+            const keywords = ['current selection', 'ftrace events', 'nothing selected'];
+            document.querySelectorAll('div, section').forEach(el => {
+                const r = el.getBoundingClientRect();
+                if (r.top < vh * 0.5 || r.height < 20) return;
+                const text = (el.textContent || '').toLowerCase().trim();
+                if (text.length > 300) return;
+                for (const kw of keywords) {
+                    if (text.includes(kw) && r.top < panelTop) {
+                        panelTop = r.top;
+                    }
+                }
+            });
+
+            // Clip region: start above anchor, extend to just above bottom panel
             const clipY = Math.max(0, Math.floor(anchorY - vh * 0.08));
-            const clipH = Math.min(vh - clipY, Math.floor(vh * 0.85));
+            const maxH = Math.floor(panelTop - clipY - 5);
+            const clipH = Math.max(200, Math.min(maxH, Math.floor(vh * 0.85)));
 
             return {x: cx, y: clipY, width: cw, height: clipH};
         }""", anchor_track)
