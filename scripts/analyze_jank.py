@@ -185,7 +185,7 @@ def main():
             by_type[jt] = j
     top_frames = sorted(by_type.values(), key=lambda x: -x["dur"])[:5]
     for frame in top_frames:
-        _enrich_top_frame(tp, frame, trace_start, trace_end)
+        _enrich_top_frame(tp, frame, trace_start, trace_end, target_pid=target["pid"])
 
     # Per-type statistics: count, avg duration, top 3 frames
     type_stats = {}
@@ -374,7 +374,7 @@ def main():
     print(f"\n[Phase 1] Complete -> {output}/")
 
 
-def _enrich_top_frame(tp, frame, trace_start, trace_end):
+def _enrich_top_frame(tp, frame, trace_start, trace_end, target_pid=None):
     ts = int(frame["ts"])
     dur = int(frame["dur"])
     jank_type = frame["jank_type"]
@@ -386,8 +386,8 @@ def _enrich_top_frame(tp, frame, trace_start, trace_end):
     focus_track = _pick_focus_track(jank_type)
     keywords = _pick_keywords(jank_type)
 
-    target_ts = _find_target_ts(tp, ts, dur, keywords)
-    evidence = _collect_evidence(tp, region_start, region_end, keywords)
+    target_ts = _find_target_ts(tp, ts, dur, keywords, target_pid=target_pid)
+    evidence = _collect_evidence(tp, region_start, region_end, keywords, target_pid=target_pid)
 
     frame["target_ts"] = int(target_ts)
     frame["focus_track"] = focus_track
@@ -423,27 +423,38 @@ def _pick_keywords(jank_type):
     return ["doFrame", "RenderThread", "surfaceflinger", "presentFence"]
 
 
-def _find_target_ts(tp, frame_ts, frame_dur, keywords):
+def _find_target_ts(tp, frame_ts, frame_dur, keywords, target_pid=None):
     frame_end = frame_ts + frame_dur
     where_kw = _sql_keyword_where("s.name", keywords)
+    pid_join = ""
+    pid_filter = ""
+    if target_pid:
+        pid_join = "JOIN thread_track tt ON s.track_id = tt.id JOIN thread t ON tt.utid = t.utid JOIN process p ON t.upid = p.upid"
+        pid_filter = f"AND p.pid = {target_pid}"
     q = tp.query(f"""
         SELECT s.ts, s.dur, s.name
         FROM slice s
+        {pid_join}
         WHERE s.ts >= {frame_ts}
           AND s.ts <= {frame_end}
           AND s.dur > 0
           AND ({where_kw})
+          {pid_filter}
         ORDER BY s.dur DESC
         LIMIT 1
     """)
     rows = list(q)
     if rows:
         return int(rows[0].ts)
+    # Fallback: no match in target process, try global
+    if target_pid:
+        return _find_target_ts(tp, frame_ts, frame_dur, keywords, target_pid=None)
     return int(frame_ts)
 
 
-def _collect_evidence(tp, start_ts, end_ts, keywords):
+def _collect_evidence(tp, start_ts, end_ts, keywords, target_pid=None):
     where_kw = _sql_keyword_where("s.name", keywords)
+    pid_filter = f"AND p.pid = {target_pid}" if target_pid else ""
     q = tp.query(f"""
         SELECT
             s.name as slice_name,
@@ -454,25 +465,32 @@ def _collect_evidence(tp, start_ts, end_ts, keywords):
         FROM slice s
         LEFT JOIN thread_track tt ON s.track_id = tt.id
         LEFT JOIN thread t ON tt.utid = t.utid
+        LEFT JOIN process p ON t.upid = p.upid
         WHERE s.ts >= {start_ts}
           AND s.ts <= {end_ts}
           AND s.dur > 0
           AND ({where_kw})
+          {pid_filter}
         ORDER BY s.dur DESC
         LIMIT 8
     """)
     out = []
     for r in q:
-        out.append(
-            {
-                "name": r.slice_name,
-                "ts": int(r.ts),
-                "dur_ns": int(r.dur),
-                "dur_ms": round(r.dur / 1e6, 3),
-                "thread": r.thread_name or "unknown",
-                "tid": r.tid,
-            }
-        )
+        out.append({
+            "name": r.slice_name,
+            "ts": int(r.ts),
+            "dur_ns": int(r.dur),
+            "dur_ms": round(r.dur / 1e6, 3),
+            "thread": r.thread_name or "unknown",
+            "tid": r.tid,
+        })
+    # If target-limited got < 3 results, supplement with global
+    if target_pid and len(out) < 3:
+        global_out = _collect_evidence(tp, start_ts, end_ts, keywords, target_pid=None)
+        seen_ts = {e["ts"] for e in out}
+        for g in global_out:
+            if g["ts"] not in seen_ts and len(out) < 8:
+                out.append(g)
     return out
 
 
