@@ -86,27 +86,69 @@ def main():
     }
     _write(output / "tp_state.json", tp_state)
 
-    # --- Step 2: Find target process ---
+    # --- Step 2: Find target process (by jank frame count, not running time) ---
     print("  [1.2] Finding target process...")
-    q = tp.query("""
-        SELECT p.name, p.pid, SUM(dur)/1e6 as total_ms
-        FROM sched s JOIN thread t ON s.utid=t.utid JOIN process p ON t.upid=p.upid
-        WHERE p.name IS NOT NULL AND p.name != ''
-          AND p.name NOT IN ('ps', 'grep', 'head', 'cat', 'sh', 'logcat')
-          AND p.name NOT LIKE '/vendor/%' AND p.name NOT LIKE '/system/%'
-          AND p.name NOT LIKE 'kworker%'
-        GROUP BY p.pid ORDER BY total_ms DESC LIMIT 10
+
+    q_jank_target = tp.query("""
+        SELECT p.name, p.pid,
+               COUNT(*) as jank_count,
+               SUM(aft.dur)/1e6 as jank_dur_ms
+        FROM actual_frame_timeline_slice aft
+        LEFT JOIN process_track pt ON aft.track_id = pt.id
+        LEFT JOIN process p ON pt.upid = p.upid
+        WHERE aft.jank_type != 'None'
+          AND p.pid IS NOT NULL
+        GROUP BY p.pid
+        ORDER BY jank_count DESC
+        LIMIT 10
     """)
-    candidates = [{"process_name": r.name, "pid": r.pid, "total_running_ms": r.total_ms} for r in q]
-    target = candidates[0] if candidates else {"process_name": "unknown", "pid": 0, "total_running_ms": 0}
-    print(f"        Target: {target['process_name']} (pid={target['pid']}, {target['total_running_ms']:.0f}ms)")
+    jank_candidates = [
+        {"process_name": r.name or f"pid_{r.pid}", "pid": r.pid,
+         "jank_count": r.jank_count, "jank_dur_ms": r.jank_dur_ms}
+        for r in q_jank_target
+    ]
+
+    if jank_candidates:
+        target = jank_candidates[0]
+        method = "jank_frame_count"
+        print(f"        Target (by jank): {target['process_name']} "
+              f"(pid={target['pid']}, {target['jank_count']} jank frames)")
+    else:
+        q_run = tp.query("""
+            SELECT p.name, p.pid, SUM(dur)/1e6 as total_ms
+            FROM sched s JOIN thread t ON s.utid=t.utid
+            JOIN process p ON t.upid=p.upid
+            WHERE p.name IS NOT NULL AND p.name != ''
+            GROUP BY p.pid ORDER BY total_ms DESC LIMIT 10
+        """)
+        jank_candidates = [
+            {"process_name": r.name, "pid": r.pid, "total_running_ms": r.total_ms}
+            for r in q_run
+        ]
+        target = jank_candidates[0] if jank_candidates else {
+            "process_name": "unknown", "pid": 0}
+        method = "running_time"
+        print(f"        Target (by running): {target['process_name']} (pid={target['pid']})")
+
+    # Resolve NULL process names from main thread name
+    if target["process_name"].startswith("pid_"):
+        q_tname = tp.query(f"""
+            SELECT t.name FROM thread t
+            JOIN process p ON t.upid = p.upid
+            WHERE p.pid = {target['pid']} AND t.tid = {target['pid']}
+              AND t.name IS NOT NULL AND t.name != ''
+            LIMIT 1
+        """)
+        for r in q_tname:
+            target["process_name"] = r.name
+            print(f"        Resolved name from main thread: {r.name}")
 
     _write(output / "target_process.json", {
-        "method": "running_time",
+        "method": method,
         "process_name": target["process_name"],
         "pid": target["pid"],
-        "total_running_ms": target["total_running_ms"],
-        "candidates": candidates,
+        "jank_count": target.get("jank_count", 0),
+        "candidates": jank_candidates,
     })
 
     # --- Step 3: Jank frame analysis ---
