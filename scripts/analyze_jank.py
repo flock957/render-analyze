@@ -261,6 +261,16 @@ def main():
     """)
     app_render = [{"name": r.name, "tid": r.tid} for r in q_app_render]
 
+    # App's hwuiTask helper threads (Skia GPU tile workers)
+    q_hwui = tp.query(f"""
+        SELECT t.name, t.tid FROM thread t
+        JOIN process p ON t.upid = p.upid
+        WHERE p.pid = {target_pid}
+          AND (t.name LIKE 'hwuiTask%%' OR t.name = 'GPU completion')
+        ORDER BY t.tid LIMIT 4
+    """)
+    app_hwui = [{"name": r.name, "tid": r.tid} for r in q_hwui]
+
     # surfaceflinger main thread (tid = pid of sf process)
     q_sf = tp.query("""
         SELECT t.name, t.tid, p.pid
@@ -328,7 +338,7 @@ def main():
 
     # Build pin patterns for the full rendering pipeline
     pin_patterns = _build_pin_patterns(
-        target, app_main, app_render, sf_main_tid, sf_pid,
+        target, app_main, app_render, app_hwui, sf_main_tid, sf_pid,
         sf_render_engine, sf_gpu, sf_binder, hwc_threads, crtc_threads
     )
 
@@ -337,6 +347,7 @@ def main():
         "target_pid": target_pid,
         "app_main_thread": app_main,
         "app_render_threads": app_render,
+        "app_hwui_threads": app_hwui,
         "sf_main_tid": sf_main_tid,
         "sf_pid": sf_pid,
         "sf_render_engine": sf_render_engine,
@@ -351,6 +362,7 @@ def main():
     has_render = len(app_render) > 0
     print(f"        App main: tid={app_main[0]['tid'] if app_main else 'N/A'}")
     print(f"        App RenderThread: {'tid=' + str(app_render[0]['tid']) if has_render else 'NOT FOUND'}")
+    print(f"        App hwuiTask: {[t['name'] for t in app_hwui]}")
     print(f"        SF main: tid={sf_main_tid} (pid={sf_pid})")
     print(f"        SF RenderEngine: {'tid=' + str(sf_render_engine[0]['tid']) if sf_render_engine else 'N/A'}")
     print(f"        SF binder: {[t['tid'] for t in sf_binder]}")
@@ -502,49 +514,51 @@ def _build_screenshot_reasoning(frame):
     )
 
 
-def _build_pin_patterns(target, app_main, app_render, sf_main_tid, sf_pid,
-                        sf_render_engine, sf_gpu, sf_binder, hwc_threads, crtc_threads):
-    """Build pin patterns covering the full rendering pipeline.
-
-    Order matters — Perfetto pins from top to bottom in pin order.
-    We want: Timeline → App threads → SF threads → HWC → CrtcCommit
-    """
+def _build_pin_patterns(target, app_main, app_render, app_hwui,
+                        sf_main_tid, sf_pid,
+                        sf_render_engine, sf_gpu, sf_binder,
+                        hwc_threads, crtc_threads):
+    """Build pin patterns. Order = top to bottom in Perfetto pinned area.
+    App main + RenderThread are always first (after Timeline)."""
     patterns = []
 
-    # 1. Expected/Actual Timeline (frame jank indicators)
-    #    Pin for both SF and target app process
+    # 1. Frame Timeline
     patterns.append("Expected Timeline")
     patterns.append("Actual Timeline")
 
-    # 2. App main thread (UI thread)
+    # 2. App main thread (most important — right after Timeline)
     if app_main:
         patterns.append(f"{app_main[0]['name']} {app_main[0]['tid']}")
 
-    # 3. App RenderThread
+    # 3. App RenderThread (second most important)
     if app_render:
         patterns.append(f"RenderThread {app_render[0]['tid']}")
 
-    # 4. SF main thread
+    # 4. App hwuiTask + GPU completion (Skia helpers)
+    for t in app_hwui[:2]:
+        patterns.append(f"{t['name']} {t['tid']}")
+
+    # 5. SF main
     if sf_main_tid:
         patterns.append(f"surfaceflinger {sf_main_tid}")
 
-    # 5. SF RenderEngine
+    # 6. SF RenderEngine
     if sf_render_engine:
         patterns.append(f"RenderEngine {sf_render_engine[0]['tid']}")
 
-    # 6. SF GPU completion
+    # 7. SF GPU completion
     if sf_gpu:
         patterns.append(f"GPU completion {sf_gpu[0]['tid']}")
 
-    # 7. SF binder (top 1 most active)
+    # 8. SF binder (top 1 most active)
     if sf_binder:
         patterns.append(f"{sf_binder[0]['name']}")
 
-    # 8. HWC/Composer
+    # 9. HWC/Composer
     for t in hwc_threads[:1]:
         patterns.append(f"{t['name']}")
 
-    # 9. CrtcCommit
+    # 10. CrtcCommit
     for t in crtc_threads[:1]:
         patterns.append(f"{t['name']}")
 
