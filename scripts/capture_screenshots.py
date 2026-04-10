@@ -185,77 +185,84 @@ def main():
                 target_ts = int(frame.get("target_ts", ts))
                 focus_track = frame.get("focus_track", "Actual Timeline")
 
-                # ── GLOBAL screenshot ────────────────────────────
+                # ── Setup (shared between global and detail) ──────
+                # Step 1: Reset state
                 _cmd(page, 'dev.perfetto.UnpinAllTracks')
                 _cmd(page, 'dev.perfetto.CollapseAllGroups')
                 _close_drawer(page)
                 _clear_search(page)
                 time.sleep(0.3)
 
-                # ExpandAll makes RenderThread visible (it's inside the "Frame
-                # Timeline" sub-group of the process, NOT in the regular thread list).
-                # Then collapse system noise + scroll to Frame Timeline area.
+                # Step 2: ExpandAll → CollapseAll (create all track nodes)
                 _cmd(page, 'dev.perfetto.ExpandAllGroups')
-                time.sleep(2)
-                # Collapse system tracks that push app tracks off-screen
+                time.sleep(3)
+                _cmd(page, 'dev.perfetto.CollapseAllGroups')
+                time.sleep(0.5)
+
+                # Step 3: Pin SF/HWC (top-level tracks → pinned at top)
+                for pat in ['surfaceflinger', 'composer-servic']:
+                    _cmd(page, 'dev.perfetto.PinTracksByRegex', pat)
+                    time.sleep(0.2)
+                page.keyboard.press("Escape")
+                time.sleep(0.2)
+                page.keyboard.press("Escape")
+                time.sleep(0.2)
+
+                # Step 4: Selectively expand target process + Frame Timeline
+                _cmd(page, 'dev.perfetto.ExpandTracksByRegex', target['process_name'])
+                time.sleep(0.5)
+                _cmd(page, 'dev.perfetto.ExpandTracksByRegex', str(target['pid']))
+                time.sleep(0.5)
+                _cmd(page, 'dev.perfetto.ExpandTracksByRegex', 'Expected Timeline')
+                time.sleep(0.5)
+                _cmd(page, 'dev.perfetto.ExpandTracksByRegex', 'Actual Timeline')
+                time.sleep(0.5)
+                page.keyboard.press("Escape")
+                time.sleep(0.2)
+
+                # Step 5: Collapse noise (system + non-target process groups)
                 for noise in ['CPU Scheduling', 'CPU Frequency', 'Ftrace',
                               'GPU', 'Scheduler', 'System', 'Kernel']:
                     _cmd(page, 'dev.perfetto.CollapseTracksByRegex', noise)
                     time.sleep(0.1)
-                # Collapse the REGULAR thread list of target process (we want
-                # Frame Timeline sub-group, not the 50+ misc threads above it)
-                for noise_thread in ['AsyncEventManag', 'DefaultDispatch',
-                                     'ChromiumNet', 'PushThreadpool']:
-                    _cmd(page, 'dev.perfetto.CollapseTracksByRegex', noise_thread)
-                    time.sleep(0.1)
-                page.keyboard.press("Escape")
-                time.sleep(0.2)
 
-                # Zoom to full trace
+                # Step 6: Force-hide sidebar + bottom panel + cookie via CSS
+                _force_hide_ui_noise(page)
+
+                # ── GLOBAL screenshot ────────────────────────────
                 global_start = int(tp_state["trace_start"])
                 global_end = int(tp_state["trace_end"])
                 _zoom_to(page, global_start, global_end)
-                time.sleep(3)
+                time.sleep(5)
+                _force_hide_ui_noise(page)
 
-                _dismiss_cookie(page)
-                _collapse_bottom_panel(page)
-                time.sleep(0.3)
-
-                # Navigate to RenderThread by clicking the omnibox and searching.
-                # RenderThread is in the Frame Timeline sub-group of the process,
-                # far below the regular thread list. Perfetto's omnibox search
-                # for slice content (e.g. "DrawFrames") should scroll to it.
-                # Search "Choreographer" to position viewport at main thread area.
-                # Main thread (Choreographer#doFrame) is just ABOVE RenderThread
-                # in the Frame Timeline sub-group, so this captures both.
                 _search_and_navigate(page, "Choreographer")
 
                 global_file = f"{i:02d}_{safe_name}_global.png"
                 page.screenshot(path=str(output / global_file))
                 print(f"         -> {global_file}")
 
-                # Save the scroll position from the global (which shows Frame Timeline)
+                # Save scroll position (Frame Timeline area)
                 saved_scroll = page.evaluate("""(() => {
                     const panels = document.querySelectorAll(
                         '[class*="scroll"], [class*="panel-container"], [class*="viewer"]'
                     );
                     for (const p of panels) {
                         if (p.scrollHeight > p.clientHeight && p.clientHeight > 200) {
-                            return {selector: p.className, top: p.scrollTop, height: p.scrollHeight};
+                            return {top: p.scrollTop, height: p.scrollHeight};
                         }
                     }
                     return {top: window.scrollY, height: document.body.scrollHeight};
                 })()""")
 
                 # ── DETAIL screenshot ────────────────────────────
-                # Only zoom — don't redo expand/collapse/search.
                 detail_window = max(int(dur * 2), 80_000_000)
                 detail_start = target_ts - detail_window
                 detail_end = target_ts + detail_window
                 _zoom_to(page, detail_start, detail_end)
-                time.sleep(2)
+                time.sleep(3)
 
-                # Restore scroll position (zoom may have reset it)
+                # Restore scroll to Frame Timeline area
                 page.evaluate(f"""(() => {{
                     const panels = document.querySelectorAll(
                         '[class*="scroll"], [class*="panel-container"], [class*="viewer"]'
@@ -268,18 +275,14 @@ def main():
                     }}
                     window.scrollTo(0, {saved_scroll.get('top', 0)});
                 }})()""")
-                time.sleep(1)
+                time.sleep(1.5)
 
-                # Click slice at target_ts for evidence
                 _click_slice_at(page, target_ts, detail_start, detail_end)
                 time.sleep(0.4)
-
-                _dismiss_cookie(page)
-                _collapse_bottom_panel(page)
-                time.sleep(0.3)
+                _force_hide_ui_noise(page)
 
                 detail_file = f"{i:02d}_{safe_name}_detail.png"
-                _take_clipped_screenshot(page, output / detail_file, "RenderThread")
+                page.screenshot(path=str(output / detail_file))
 
                 # Annotate with highlight box + title bar
                 evidence = frame.get("evidence_slices", [])
@@ -490,6 +493,47 @@ def _clear_search(page):
         page.keyboard.press("Escape")
         time.sleep(0.2)
     except: pass
+
+
+def _force_hide_ui_noise(page):
+    """Force-hide sidebar, bottom panel, and cookie via CSS.
+    This reclaims ~300px of vertical space for track content."""
+    try:
+        page.evaluate("""(() => {
+            // Hide sidebar
+            document.querySelectorAll('.pf-sidebar, [class*="sidebar"], nav').forEach(el => {
+                if (el.offsetWidth > 50) el.style.display = 'none';
+            });
+            // Hide bottom panel
+            const kw = ['current selection', 'ftrace events', 'nothing selected'];
+            document.querySelectorAll('div, section').forEach(el => {
+                const r = el.getBoundingClientRect();
+                if (r.top < window.innerHeight * 0.6 || r.height < 20) return;
+                const t = (el.textContent || '').toLowerCase().trim();
+                if (t.length > 300) return;
+                for (const k of kw) {
+                    if (t.includes(k)) {
+                        let n = el;
+                        while (n.parentElement && n.parentElement.getBoundingClientRect().top > window.innerHeight * 0.6) n = n.parentElement;
+                        n.style.display = 'none';
+                        let s = n.nextElementSibling;
+                        while (s) { s.style.display = 'none'; s = s.nextElementSibling; }
+                        return;
+                    }
+                }
+            });
+            // Cookie cleanup
+            document.querySelectorAll('[class*="cookie"],[id*="cookie"],[class*="consent"]').forEach(el => el.remove());
+            document.querySelectorAll('div').forEach(el => {
+                try {
+                    const s = getComputedStyle(el);
+                    if (s.position === 'fixed' && el.offsetHeight < 200 &&
+                        (parseInt(s.bottom) <= 20 || parseInt(s.top) > window.innerHeight - 200)) el.remove();
+                } catch(e) {}
+            });
+        })()""")
+    except:
+        pass
 
 
 def _collapse_bottom_panel(page):
