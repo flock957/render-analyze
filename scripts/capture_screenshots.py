@@ -192,63 +192,93 @@ def main():
                 _clear_search(page)
                 time.sleep(0.3)
 
-                # Expand target process + SF (single pass, no re-collapse)
-                _cmd(page, 'dev.perfetto.ExpandTracksByRegex', target['process_name'])
-                time.sleep(0.3)
-                _cmd(page, 'dev.perfetto.ExpandTracksByRegex', str(target['pid']))
-                time.sleep(0.3)
-                _cmd(page, 'dev.perfetto.ExpandTracksByRegex', 'surfaceflinger')
-                time.sleep(0.3)
+                # ExpandAll makes RenderThread visible (it's inside the "Frame
+                # Timeline" sub-group of the process, NOT in the regular thread list).
+                # Then collapse system noise + scroll to Frame Timeline area.
+                _cmd(page, 'dev.perfetto.ExpandAllGroups')
+                time.sleep(2)
+                # Collapse system tracks that push app tracks off-screen
+                for noise in ['CPU Scheduling', 'CPU Frequency', 'Ftrace',
+                              'GPU', 'Scheduler', 'System', 'Kernel']:
+                    _cmd(page, 'dev.perfetto.CollapseTracksByRegex', noise)
+                    time.sleep(0.1)
+                # Collapse the REGULAR thread list of target process (we want
+                # Frame Timeline sub-group, not the 50+ misc threads above it)
+                for noise_thread in ['AsyncEventManag', 'DefaultDispatch',
+                                     'ChromiumNet', 'PushThreadpool']:
+                    _cmd(page, 'dev.perfetto.CollapseTracksByRegex', noise_thread)
+                    time.sleep(0.1)
+                page.keyboard.press("Escape")
+                time.sleep(0.2)
 
-                # Zoom to full trace and wait for rendering
+                # Zoom to full trace
                 global_start = int(tp_state["trace_start"])
                 global_end = int(tp_state["trace_end"])
                 _zoom_to(page, global_start, global_end)
-                time.sleep(3)  # longer wait for full-trace rendering
+                time.sleep(3)
 
-                # Scroll to target process area
-                _scroll_to_track(page, target['process_name'])
-                time.sleep(0.5)
                 _dismiss_cookie(page)
                 _collapse_bottom_panel(page)
-                page.keyboard.press("Escape")
                 time.sleep(0.3)
 
+                # Navigate to RenderThread by clicking the omnibox and searching.
+                # RenderThread is in the Frame Timeline sub-group of the process,
+                # far below the regular thread list. Perfetto's omnibox search
+                # for slice content (e.g. "DrawFrames") should scroll to it.
+                try:
+                    omnibox = page.locator('input').first
+                    omnibox.click()
+                    time.sleep(0.3)
+                    omnibox.fill('DrawFrames')
+                    time.sleep(0.3)
+                    page.keyboard.press('Enter')
+                    time.sleep(0.5)
+                    page.keyboard.press('Enter')
+                    time.sleep(0.3)
+                    page.keyboard.press('Escape')
+                    time.sleep(0.3)
+                except Exception:
+                    pass
+
                 global_file = f"{i:02d}_{safe_name}_global.png"
-                _take_clipped_screenshot(page, output / global_file, target['process_name'])
+                page.screenshot(path=str(output / global_file))
                 print(f"         -> {global_file}")
 
                 # ── DETAIL screenshot ────────────────────────────
-                # Zoom to target_ts region
                 detail_window = max(int(dur * 2), 80_000_000)
                 detail_start = target_ts - detail_window
                 detail_end = target_ts + detail_window
                 _zoom_to(page, detail_start, detail_end)
-                time.sleep(1.0)
+                time.sleep(1.5)
 
-                # Expand target process tracks for detail view
-                _cmd(page, 'dev.perfetto.ExpandTracksByRegex', target['process_name'])
-                time.sleep(0.3)
-                _cmd(page, 'dev.perfetto.ExpandTracksByRegex', str(target['pid']))
-                time.sleep(0.3)
-                if "App Deadline" in jank_type or "Buffer Stuffing" in jank_type:
-                    _cmd(page, 'dev.perfetto.ExpandTracksByRegex', 'RenderThread')
-                    time.sleep(0.3)
+                # ExpandAll so RenderThread sub-tracks are visible
+                _cmd(page, 'dev.perfetto.ExpandAllGroups')
+                time.sleep(2)
 
-                # Scroll to focus track + click slice for evidence
-                _scroll_to_track(page, focus_track)
-                time.sleep(0.3)
+                # Search for a slice on the focus track to navigate there.
+                # Use evidence slice name if available (most precise), else generic.
+                ev_slices = frame.get("evidence_slices", [])
+                # Navigate to focus track by searching for a characteristic slice.
+                if "App Deadline" in jank_type or "Buffer" in jank_type:
+                    _scroll_to_track(page, "DrawFrames")
+                elif "SurfaceFlinger" in jank_type:
+                    _scroll_to_track(page, "composite")
+                elif "Display HAL" in jank_type:
+                    _scroll_to_track(page, "present")
+                else:
+                    _scroll_to_track(page, "doFrame")
+                time.sleep(0.5)
+
+                # Click slice at target_ts for evidence
                 _click_slice_at(page, target_ts, detail_start, detail_end)
                 time.sleep(0.4)
 
                 _dismiss_cookie(page)
                 _collapse_bottom_panel(page)
-                page.keyboard.press("Escape")
                 time.sleep(0.3)
 
-                # Clip screenshot centered on focus track area
                 detail_file = f"{i:02d}_{safe_name}_detail.png"
-                _take_clipped_screenshot(page, output / detail_file, focus_track)
+                _take_clipped_screenshot(page, output / detail_file, "RenderThread")
 
                 # Annotate with highlight box + title bar
                 evidence = frame.get("evidence_slices", [])
@@ -696,41 +726,31 @@ def _annotate_detail(filepath, target_ts, vis_start, vis_end, jank_type, evidenc
         print(f"         [annotate] {e}")
 
 
-def _scroll_to_track(page, track_name):
-    """Scroll the Perfetto UI so that a track matching track_name is visible.
+def _scroll_to_track(page, slice_search_term):
+    """Scroll Perfetto UI to show a track by searching for a SLICE on it.
 
-    Uses Perfetto's internal search or DOM text matching to find the track,
-    then scrolls it into view at the upper portion of the viewport.
+    Perfetto uses virtualized scrolling — off-screen tracks have no DOM.
+    The reliable method: use Perfetto's search mode to find a slice by name
+    (e.g. "DrawFrames" finds a slice on RenderThread), which causes Perfetto
+    to scroll the track into view and highlight the match.
+
+    slice_search_term should be a SLICE name (not track name).
     """
-    if not track_name:
+    if not slice_search_term:
         return
     try:
-        page.evaluate("""(name) => {
-            const needle = name.toLowerCase();
-            // Search through all elements that look like track labels
-            const candidates = document.querySelectorAll(
-                '[class*="track"] [class*="title"], [class*="track"] [class*="name"],' +
-                '[class*="shell"], [class*="pf-track"], [class*="trackShell"]'
-            );
-            for (const el of candidates) {
-                const text = (el.textContent || '').trim().toLowerCase();
-                if (text && text.includes(needle)) {
-                    // Scroll the track into view — aim for upper quarter
-                    el.scrollIntoView({block: 'start', behavior: 'instant'});
-                    return true;
-                }
-            }
-            // Fallback: search in all divs/spans with short text
-            const all = document.querySelectorAll('div, span');
-            for (const el of all) {
-                const text = (el.textContent || '').trim().toLowerCase();
-                if (text.length > 2 && text.length < 80 && text.includes(needle)) {
-                    el.scrollIntoView({block: 'start', behavior: 'instant'});
-                    return true;
-                }
-            }
-            return false;
-        }""", track_name)
+        # Activate search mode via Perfetto command
+        _cmd(page, 'dev.perfetto.SwitchToSearchMode')
+        time.sleep(0.3)
+        # Type search term — Perfetto will search slice names
+        page.keyboard.type(slice_search_term, delay=20)
+        time.sleep(0.5)
+        # Navigate to first match — this scrolls the view
+        _cmd(page, 'dev.perfetto.SearchNext')
+        time.sleep(0.5)
+        # Search again to ensure we're on the right match
+        _cmd(page, 'dev.perfetto.SearchNext')
+        time.sleep(0.3)
     except Exception:
         pass
 
