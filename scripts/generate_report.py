@@ -22,9 +22,15 @@ FRAMEWORK_KB = {
             "  → ANIMATION callbacks (属性动画/过渡动画)",
             "  → TRAVERSAL: ViewRootImpl.performTraversals()",
             "    → performMeasure() → performLayout() → performDraw()",
-            "  → ThreadedRenderer.draw() → syncFrameState",
-            "RenderThread: nSyncAndDrawFrame → issueDrawCommands",
-            "RenderThread: queueBuffer → 提交给 SurfaceFlinger",
+            "  → ThreadedRenderer.draw() → postAndWait 同步到 RenderThread",
+            "RenderThread: DrawFrames (HWUI 帧入口)",
+            "  → syncFrameState (从 UI 线程同步 RenderNode 树 + prepareTree)",
+            "  → renderFrameImpl (Skia SkCanvas 指令录制: drawBitmap/drawPath/drawText)",
+            "  → flush commands (Skia GrContext::flush → OpsTask::onExecute → GPU Op 批处理)",
+            "    → FillRectOp / TextureOp / PathStencilCoverOp (具体 Skia GPU Op)",
+            "  → eglSwapBuffersWithDamageKHR (EGL 提交帧 buffer → 等待 GPU fence)",
+            "  → Waiting for GPU (GPU completion fence — GPU 完成所有绘制)",
+            "  → queueBuffer → 提交帧到 BufferQueue → SurfaceFlinger 消费",
         ],
         "source_refs": [
             {
@@ -42,6 +48,27 @@ FRAMEWORK_KB = {
                 "path": "frameworks/base/core/java/android/view/ThreadedRenderer.java",
                 "desc": "draw() 将 DisplayList 同步到 RenderThread (syncFrameState)，然后 RenderThread 执行 nSyncAndDrawFrame 提交 GPU 指令。Trace 中看 'syncFrameState' 耗时 → 主线程和 RenderThread 的同步开销。",
             },
+            {
+                "file": "CanvasContext.cpp",
+                "path": "frameworks/base/libs/hwui/renderthread/CanvasContext.cpp",
+                "desc": "draw() 是 RenderThread 的帧入口，对应 Trace 中的 'DrawFrames' slice。"
+                        "内部: prepareTree → syncFrameState → renderFrameImpl → flush → eglSwapBuffers。"
+                        "瓶颈: renderFrameImpl 长 → Skia 绘制指令多; flush commands 长 → GPU Op 多; "
+                        "eglSwapBuffers 长 → GPU 渲染慢或 buffer 争用。",
+            },
+            {
+                "file": "EglManager.cpp",
+                "path": "frameworks/base/libs/hwui/renderthread/EglManager.cpp",
+                "desc": "eglSwapBuffersWithDamageKHR() 提交帧 buffer 到 BufferQueue。正常 < 2ms。"
+                        "如果 > 5ms → GPU 未完成渲染 (Waiting for GPU fence)，或 BufferQueue 满。"
+                        "后面紧跟的 'Waiting for GPU' slice = GPU 实际渲染时间。",
+            },
+            {
+                "file": "ShaderCache.cpp",
+                "path": "frameworks/base/libs/hwui/pipeline/skia/ShaderCache.cpp",
+                "desc": "Skia shader 首次编译触发 'shader_compile' + 'cache_miss'。每次 7-11ms，"
+                        "冷启动可能连续 9+ 次。优化: Vulkan pipeline cache 或 ShaderCache warmup。",
+            },
         ],
         "trace_guide": [
             "在 Perfetto 中定位 Actual Timeline 的红色帧，查看对应的 `Choreographer#doFrame` slice",
@@ -50,6 +77,12 @@ FRAMEWORK_KB = {
             "检查 RenderThread 的 `DrawFrame` / `syncFrameState` 耗时",
             "检查主线程是否有 `Binder.transact`、`GC`、`JIT compiling` 等阻塞 slice",
             "检查线程状态: Running (绿色) vs Sleeping (蓝色) vs Runnable (白色) vs Uninterruptible (橙色)",
+            "**展开 RenderThread** 的 DrawFrames slice，检查子 slice 层级:",
+            "  syncFrameState → renderFrameImpl → flush commands → eglSwapBuffers → Waiting for GPU",
+            "如果 renderFrameImpl 长: Skia 绘制指令多 → 检查 Canvas 操作复杂度和 draw call 数量",
+            "如果 flush commands 长: GPU Op 执行慢 → 检查 OpsTask::onExecute 中哪个 Op 最耗时",
+            "如果 eglSwapBuffers + Waiting for GPU 长: GPU 渲染慢 → 检查 GPU 频率和 shader 复杂度",
+            "检查是否有 'shader_compile' / 'cache_miss' — 每次 7-11ms 的冷启动 jank 源",
         ],
         "root_causes": [
             "**Measure/Layout 过重**: View 层级深、RelativeLayout 嵌套、RecyclerView 多类型 item",
@@ -59,6 +92,10 @@ FRAMEWORK_KB = {
             "**主线程 Binder 调用**: 同步 IPC 等待远端进程响应 (ContentProvider/Service)",
             "**GC / JIT**: 运行时垃圾回收暂停，JIT 编译暂停",
             "**锁竞争**: synchronized/ReentrantLock 等待其他线程释放锁",
+            "**RenderThread GPU 管线瓶颈**: renderFrameImpl/flush commands/eglSwapBuffers 某段超长",
+            "**Skia 绘制指令过多**: 大量 drawBitmap/drawPath/drawText 或 saveLayer，表现为 Drawing slice 和 OpsTask 耗时长",
+            "**Shader 编译卡顿 (冷启动)**: 首次渲染特定 effect 时触发 shader_compile，每次 7-11ms",
+            "**GPU 频率低 / Thermal 降频**: flush commands 和 Waiting for GPU 同时变长",
         ],
         "optimizations": [
             "使用 `ConstraintLayout` 减少嵌套层级，避免 `RelativeLayout` 嵌套导致双 measure",
@@ -68,17 +105,23 @@ FRAMEWORK_KB = {
             "使用 `ViewPropertyAnimator` 或 `RenderThread` 动画替代主线程动画",
             "减少 `Canvas.saveLayer()` 调用（触发 offscreen buffer 分配）",
             "使用 Systrace/Perfetto 标记 `Trace.beginSection()` 定位业务代码瓶颈",
+            "**展开 DrawFrames** slice 做 RenderThread 瓶颈定位: syncFrameState / renderFrameImpl / flush / eglSwap / Waiting for GPU",
+            "减少 Canvas.drawPath() 复杂度, 对静态 Path 使用缓存",
+            "使用 ShaderCache warmup 减少冷启动 shader_compile 卡顿",
         ],
     },
     "Display HAL": {
         "cn_name": "显示 HAL 延迟",
         "call_chain": [
             "SurfaceFlinger.onMessageRefresh()",
-            "  → commit() → composite() → presentDisplay()",
-            "HWComposer.presentAndGetReleaseFences()",
+            "  → prepareFrame() → HwcPresentOrValidateDisplay()",
+            "  → postFramebuffer() → HWComposer.presentAndGetReleaseFences()",
             "HWC HAL: presentDisplay() → 提交帧到显示控制器",
-            "Kernel: DRM/KMS → Display Controller → Panel",
-            "返回 presentFence → SF 在下一帧等待此 fence",
+            "  → [composer-servic] PerformCommit → HWDeviceDRM::Commit",
+            "    → HWDeviceDRM::AtomicCommit → DRMAtomicReq::Commit",
+            "Kernel: DRM/KMS → crtc_commit → Display Controller → Panel",
+            "返回 presentFence → SF 在下一帧 postComposition 中等待此 fence",
+            "[HWC release] waitForever → 释放上一帧 buffer",
         ],
         "source_refs": [
             {
@@ -120,10 +163,14 @@ FRAMEWORK_KB = {
         "call_chain": [
             "VSYNC-sf 信号到达",
             "SurfaceFlinger.onMessageRefresh()",
-            "  → handleTransaction(): 处理 App 提交的 Surface 状态变更",
-            "  → handleComposition(): 计算 Layer 可见区域/混合模式/变换矩阵",
-            "  → composite(): GPU 或 HWC 合成",
-            "  → postComposition(): fence 管理、帧统计",
+            "  → latchBuffers(): 从 BufferQueue 获取 App 提交的 buffer",
+            "  → rebuildLayerStacks(): 计算 Layer 可见区域和层级",
+            "  → prepareFrame(): 决定合成策略 (HWC overlay vs GPU fallback)",
+            "    → chooseCompositionStrategy() → HwcPresentOrValidateDisplay()",
+            "  → finishFrame(): 执行合成",
+            "    → composeSurfaces(): GPU 合成路径 (RenderEngine::drawLayers)",
+            "  → postFramebuffer(): 提交合成结果到显示控制器",
+            "  → postComposition(): fence 管理、present fence 等待、帧统计",
         ],
         "source_refs": [
             {
@@ -144,6 +191,8 @@ FRAMEWORK_KB = {
             "检查 SF 线程状态: 是否有 Runnable (排队等 CPU) 或 Uninterruptible (等 I/O)",
             "检查 SF Binder 线程的 'setTransactionState' — 频繁事务导致锁竞争",
             "Layer 数量: `dumpsys SurfaceFlinger --list` 查看当前 Layer 列表",
+            "重点检查 'prepareFrame' / 'chooseCompositionStrategy' 耗时 — 是否 HWC 验证慢",
+            "如果 composeSurfaces 长 → Layer 过多导致 GPU 合成回退，检查 REThreaded::drawLayers",
         ],
         "root_causes": [
             "**Layer 数量过多**: App 大量独立 Surface (多窗口/画中画/浮窗/SurfaceView)",
@@ -161,11 +210,13 @@ FRAMEWORK_KB = {
     "Buffer Stuffing": {
         "cn_name": "Buffer 塞满",
         "call_chain": [
-            "App RenderThread: nSyncAndDrawFrame → issueDrawCommands",
-            "App RenderThread: Surface.queueBuffer() → 提交 buffer 给 BufferQueue",
-            "App RenderThread: Surface.dequeueBuffer() → 尝试获取下一个空 buffer",
+            "App RenderThread: DrawFrames → renderFrameImpl → flush commands",
+            "App RenderThread: eglSwapBuffersWithDamageKHR → queueBuffer (提交 buffer)",
+            "App RenderThread: dequeueBuffer → 尝试获取下一个空 buffer",
             "  → BufferQueueProducer.dequeueBuffer() 阻塞（所有 slot 被占）",
-            "SF: onMessageRefresh → acquireBuffer() → latchBuffer() → 消费 buffer",
+            "  → 阻塞原因: SF 还没消费前面的 buffer (SF 合成慢/presentFence 慢)",
+            "SF: onMessageRefresh → latchBuffers → acquireBuffer() → 消费 buffer",
+            "SF: present → waiting for presentFence → 等待上一帧的显示完成",
         ],
         "source_refs": [
             {
