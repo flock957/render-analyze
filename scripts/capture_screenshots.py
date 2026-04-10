@@ -225,20 +225,10 @@ def main():
                 # RenderThread is in the Frame Timeline sub-group of the process,
                 # far below the regular thread list. Perfetto's omnibox search
                 # for slice content (e.g. "DrawFrames") should scroll to it.
-                try:
-                    omnibox = page.locator('input').first
-                    omnibox.click()
-                    time.sleep(0.3)
-                    omnibox.fill('DrawFrames')
-                    time.sleep(0.3)
-                    page.keyboard.press('Enter')
-                    time.sleep(0.5)
-                    page.keyboard.press('Enter')
-                    time.sleep(0.3)
-                    page.keyboard.press('Escape')
-                    time.sleep(0.3)
-                except Exception:
-                    pass
+                # Search "Choreographer" to position viewport at main thread area.
+                # Main thread (Choreographer#doFrame) is just ABOVE RenderThread
+                # in the Frame Timeline sub-group, so this captures both.
+                _search_and_navigate(page, "Choreographer")
 
                 global_file = f"{i:02d}_{safe_name}_global.png"
                 page.screenshot(path=str(output / global_file))
@@ -251,23 +241,27 @@ def main():
                 _zoom_to(page, detail_start, detail_end)
                 time.sleep(1.5)
 
-                # ExpandAll so RenderThread sub-tracks are visible
+                # ExpandAll so RenderThread (in Frame Timeline sub-group) is visible
                 _cmd(page, 'dev.perfetto.ExpandAllGroups')
                 time.sleep(2)
+                # Collapse system noise
+                for noise in ['CPU Scheduling', 'CPU Frequency', 'Ftrace',
+                              'GPU', 'Scheduler', 'System', 'Kernel']:
+                    _cmd(page, 'dev.perfetto.CollapseTracksByRegex', noise)
+                    time.sleep(0.1)
+                page.keyboard.press("Escape")
+                time.sleep(0.2)
 
-                # Search for a slice on the focus track to navigate there.
-                # Use evidence slice name if available (most precise), else generic.
-                ev_slices = frame.get("evidence_slices", [])
-                # Navigate to focus track by searching for a characteristic slice.
+                # Navigate to focus track via omnibox search
                 if "App Deadline" in jank_type or "Buffer" in jank_type:
-                    _scroll_to_track(page, "DrawFrames")
+                    _search_and_navigate(page, "DrawFrames")
                 elif "SurfaceFlinger" in jank_type:
-                    _scroll_to_track(page, "composite")
+                    _search_and_navigate(page, "composite")
                 elif "Display HAL" in jank_type:
-                    _scroll_to_track(page, "present")
+                    _search_and_navigate(page, "present")
                 else:
-                    _scroll_to_track(page, "doFrame")
-                time.sleep(0.5)
+                    _search_and_navigate(page, "Choreographer")
+                time.sleep(0.3)
 
                 # Click slice at target_ts for evidence
                 _click_slice_at(page, target_ts, detail_start, detail_end)
@@ -724,6 +718,31 @@ def _annotate_detail(filepath, target_ts, vis_start, vis_end, jank_type, evidenc
         result.convert("RGB").save(str(filepath))
     except Exception as e:
         print(f"         [annotate] {e}")
+
+
+def _search_and_navigate(page, search_term):
+    """Use Perfetto's omnibox to search for a slice and scroll to its track.
+
+    This is the reliable way to navigate in Perfetto's virtualized track list.
+    Typing a slice name (e.g. "DrawFrames") in the omnibox triggers Perfetto's
+    internal search which scrolls the virtualized list to the matching track.
+    """
+    if not search_term:
+        return
+    try:
+        omnibox = page.locator('input').first
+        omnibox.click()
+        time.sleep(0.3)
+        omnibox.fill(search_term)
+        time.sleep(0.3)
+        page.keyboard.press('Enter')
+        time.sleep(0.5)
+        page.keyboard.press('Enter')
+        time.sleep(0.3)
+        page.keyboard.press('Escape')
+        time.sleep(0.3)
+    except Exception:
+        pass
 
 
 def _scroll_to_track(page, slice_search_term):
