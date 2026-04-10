@@ -33,7 +33,8 @@
 
 全部 main thread + RenderThread 在截图中可见。
 
-## 待优化
-- [ ] 设置 trace 全局图 track 内容稀疏（可能需要更窄的 clip 或更好的 scroll 定位）
-- [ ] Ftrace Events 面板仍偶尔出现在底部
-- [ ] 部分 detail 截图 "Nothing selected"（slice click 未命中）
+## 已修复（c5808ec → 56cbed7）
+- [x] Current Selection / Ftrace Events 面板完全消失 — 位置检测+CSS隐藏+clip排除
+- [x] clip-based 截图替代 pin-to-top（Perfetto 限制）
+- [x] slice click 改用 canvas getBoundingClientRect 精确定位
+- [ ] 全局图展开了所有子线程（50+ 行）— 可选优化
