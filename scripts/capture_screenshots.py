@@ -241,7 +241,14 @@ def main():
 
                 detail_file = f"{i:02d}_{safe_name}_detail.png"
                 _take_screenshot(page, output / detail_file)
-                print(f"         -> {detail_file}")
+                # Annotate with highlight box + title bar
+                evidence = frame.get("evidence_slices", [])
+                _annotate_detail(
+                    output / detail_file,
+                    target_ts, detail_start, detail_end,
+                    jank_type, evidence,
+                )
+                print(f"         -> {detail_file} (annotated)")
 
                 results.append({
                     "name": jank_type,
@@ -545,6 +552,82 @@ def _click_slice_at(page, target_ts, vis_start_ns, vis_end_ns):
         page.mouse.click(click_x, click_y)
     except Exception:
         pass
+
+
+def _annotate_detail(filepath, target_ts, vis_start, vis_end, jank_type, evidence):
+    """Overlay a translucent highlight column + title bar on detail screenshot.
+
+    The highlight marks the x-region around target_ts so the reader's eye is
+    immediately drawn to the evidence area. A small title bar at the top shows
+    the jank type and top evidence slice.
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return  # Pillow not installed — skip silently
+
+    try:
+        img = Image.open(str(filepath)).convert("RGBA")
+        w, h = img.size
+
+        # Compute x-range for the highlight (target_ts ± 5% of visible window)
+        if vis_end <= vis_start:
+            return
+        ts_ratio = (int(target_ts) - int(vis_start)) / (int(vis_end) - int(vis_start))
+        ts_ratio = max(0.02, min(0.98, ts_ratio))
+        # Track area starts after the left label gutter (~18% of width)
+        gutter = int(w * 0.18)
+        track_w = w - gutter
+        center_x = gutter + int(track_w * ts_ratio)
+        half_w = max(int(track_w * 0.05), 40)  # 5% of track width, min 40px
+
+        x_left = max(gutter, center_x - half_w)
+        x_right = min(w, center_x + half_w)
+
+        # Draw translucent red column over the full height (skip top 60px header)
+        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+        draw.rectangle(
+            [x_left, 60, x_right, h - 20],
+            fill=(255, 60, 60, 35),       # very light red tint
+            outline=(255, 60, 60, 180),   # red border
+            width=2,
+        )
+
+        # Title bar at top
+        top_ev = evidence[0] if evidence else None
+        if top_ev:
+            title = f"{jank_type}  |  {top_ev['name']}@{top_ev['thread']} ({top_ev['dur_ms']}ms)"
+        else:
+            title = jank_type
+        # Truncate if too long
+        title = title[:100]
+
+        # Draw title background
+        bar_h = 36
+        draw.rectangle([0, 0, w, bar_h], fill=(30, 30, 30, 220))
+
+        # Draw title text
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 20)
+        except Exception:
+            font = ImageFont.load_default()
+        draw.text((12, 8), title, fill=(255, 200, 200, 255), font=font)
+
+        # Small "target_ts" label near the highlight
+        ts_label = f"target_ts"
+        try:
+            small_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
+        except Exception:
+            small_font = font
+        label_x = max(gutter, center_x - 40)
+        draw.text((label_x, bar_h + 4), ts_label, fill=(255, 100, 100, 200), font=small_font)
+
+        # Composite and save
+        result = Image.alpha_composite(img, overlay)
+        result.convert("RGB").save(str(filepath))
+    except Exception as e:
+        print(f"         [annotate] {e}")
 
 
 def _take_screenshot(page, filepath):

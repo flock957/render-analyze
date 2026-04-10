@@ -102,10 +102,10 @@ Pin 9 条渲染管线 track（顺序 = 从上到下）：
 ### 关键词集合（部分）
 | Jank 类型 | 关键词 |
 |-----------|--------|
-| App Deadline Missed | doFrame, performTraversals, DrawFrame, RenderThread, queueBuffer |
-| Buffer Stuffing | dequeueBuffer, queueBuffer, acquireBuffer, latchBuffer |
-| SF CPU Deadline Missed | onMessageRefresh, commit, composite, RenderEngine |
-| Display HAL | presentFence, presentDisplay, composer, hwc |
+| App Deadline Missed | doFrame, performTraversals, DrawFrame, DrawFrames, renderFrameImpl, flush commands, Waiting for GPU, syncFrameState, nSyncAndDrawFrame, eglSwapBuffers, measure, layout, draw, Binder, GC, JIT, queueBuffer |
+| Buffer Stuffing | dequeueBuffer, queueBuffer, acquireBuffer, latchBuffer, DrawFrames, renderFrameImpl, flush commands, Waiting for GPU |
+| SF CPU Deadline Missed | onMessageRefresh, commit, composite, RenderEngine, handleTransaction, handleComposition, postComposition |
+| Display HAL | presentFence, presentDisplay, composer, hwc, crtc_commit, waiting for presentFence |
 | Prediction Error | Expected Timeline, Actual Timeline, VSync |
 
 完整集合见 `scripts/analyze_jank.py` 顶部 `KEYWORDS_BY_JANK_TYPE`。

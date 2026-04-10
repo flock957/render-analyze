@@ -10,10 +10,28 @@ import sys
 from pathlib import Path
 
 KEYWORDS_BY_JANK_TYPE = {
-    "App Deadline Missed": ["doFrame", "performTraversals", "DrawFrame", "RenderThread", "queueBuffer"],
-    "Buffer Stuffing": ["dequeueBuffer", "queueBuffer", "acquireBuffer", "latchBuffer"],
-    "SurfaceFlinger CPU Deadline Missed": ["onMessageRefresh", "commit", "composite", "RenderEngine"],
-    "Display HAL": ["presentFence", "presentDisplay", "composer", "hwc"],
+    "App Deadline Missed": [
+        "doFrame", "performTraversals", "DrawFrame", "DrawFrames",
+        "RenderThread", "queueBuffer",
+        # 渲染管线关键 slice
+        "renderFrameImpl", "flush commands", "Waiting for GPU",
+        "syncFrameState", "nSyncAndDrawFrame", "eglSwapBuffers",
+        "measure", "layout", "draw",
+        # 常见阻塞源
+        "Binder", "GC", "JIT",
+    ],
+    "Buffer Stuffing": [
+        "dequeueBuffer", "queueBuffer", "acquireBuffer", "latchBuffer",
+        "DrawFrames", "renderFrameImpl", "flush commands", "Waiting for GPU",
+    ],
+    "SurfaceFlinger CPU Deadline Missed": [
+        "onMessageRefresh", "commit", "composite", "RenderEngine",
+        "handleTransaction", "handleComposition", "postComposition",
+    ],
+    "Display HAL": [
+        "presentFence", "presentDisplay", "composer", "hwc",
+        "crtc_commit", "waiting for presentFence",
+    ],
     "Prediction Error": ["Expected Timeline", "Actual Timeline", "VSync"],
     "SurfaceFlinger Scheduling": ["surfaceflinger", "onMessageRefresh", "sched"],
 }

@@ -25,11 +25,54 @@ venv 安装说明。
 | 文件 | 内容 |
 |------|------|
 | `target_process.json` | 目标进程（running time 最长的 app） |
-| `app_jank.json` | Jank 帧统计 + top-5 帧 + 类型分布 |
+| `app_jank.json` | Jank 帧统计 + top-5 帧（含证据增补） + 类型分布 |
 | `sf_jank.json` | SurfaceFlinger 相关 jank |
 | `jank_types.json` | 所有 jank 类型汇总 |
 | `thread_map.json` | 完整渲染管线线程映射 + pin 模式（核心输出） |
 | `tp_state.json` | Trace 时间范围等元数据 |
+
+## 证据增补（v4.0 新增）
+
+对 `app_jank.json` 的 `top_frames` 每一项，在 SQL 查询后自动增补以下字段：
+
+| 字段 | 来源 | 说明 |
+|------|------|------|
+| `target_ts` | SQL: 帧时段内匹配关键词的最长 slice 起点 | 故障锚点时刻 |
+| `focus_track` | `FOCUS_TRACK_BY_JANK_TYPE[jank_type]` | 焦点轨道 |
+| `evidence_slices` | SQL: region 内匹配关键词 Top-8 slice | 含 name/thread/dur_ms/ts |
+| `keywords_hit` | evidence 中实际命中的关键词集合 | 如 `["doFrame","DrawFrame"]` |
+| `region_range` | `{start_ts, end_ts, window_ms}` | 检索窗口（帧 ± 2×dur, min 200ms） |
+| `problem_description` | 模板拼接 | 中文问题描述 |
+| `screenshot_reasoning` | 模板拼接 | 截图逻辑复盘说明 |
+
+### 关键词集合
+
+```python
+KEYWORDS_BY_JANK_TYPE = {
+    "App Deadline Missed": [
+        "doFrame", "performTraversals", "DrawFrame", "DrawFrames",
+        "renderFrameImpl", "flush commands", "Waiting for GPU",
+        "syncFrameState", "nSyncAndDrawFrame", "eglSwapBuffers",
+        "measure", "layout", "draw", "Binder", "GC", "JIT", "queueBuffer",
+    ],
+    "Buffer Stuffing": [
+        "dequeueBuffer", "queueBuffer", "acquireBuffer", "latchBuffer",
+        "DrawFrames", "renderFrameImpl", "flush commands", "Waiting for GPU",
+    ],
+    "SurfaceFlinger CPU Deadline Missed": [
+        "onMessageRefresh", "commit", "composite", "RenderEngine",
+        "handleTransaction", "handleComposition", "postComposition",
+    ],
+    "Display HAL": [
+        "presentFence", "presentDisplay", "composer", "hwc",
+        "crtc_commit", "waiting for presentFence",
+    ],
+    "Prediction Error": ["Expected Timeline", "Actual Timeline", "VSync"],
+    "SurfaceFlinger Scheduling": ["surfaceflinger", "onMessageRefresh", "sched"],
+}
+```
+
+这些全是**硬编码**字典查找，零 LLM 参与，同一 trace 产出完全相同结果。
 
 ## thread_map.json 结构（v3.0）
 
