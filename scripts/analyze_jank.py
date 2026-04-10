@@ -11,29 +11,66 @@ from pathlib import Path
 
 KEYWORDS_BY_JANK_TYPE = {
     "App Deadline Missed": [
-        "doFrame", "performTraversals", "DrawFrame", "DrawFrames",
-        "RenderThread", "queueBuffer",
-        # 渲染管线关键 slice
-        "renderFrameImpl", "flush commands", "Waiting for GPU",
-        "syncFrameState", "nSyncAndDrawFrame", "eglSwapBuffers",
+        # Layer 1: UI Thread
+        "doFrame", "traversal", "performTraversals",
+        "input", "animation",
         "measure", "layout", "draw",
-        # 常见阻塞源
-        "Binder", "GC", "JIT",
+        "Record View#draw()", "postAndWait", "inflate",
+        "Binder", "GC", "JIT", "Monitor contention",
+        # Layer 2: RenderThread (HWUI/Skia)
+        "DrawFrame", "DrawFrames",
+        "syncFrameState", "prepareTree",
+        "renderFrameImpl", "Drawing",
+        "flush commands", "OpsTask",
+        "eglSwapBuffers", "Waiting for GPU",
+        "queueBuffer", "dequeueBuffer",
+        # Layer 2b: Shader compilation
+        "shader_compile", "cache_miss",
+        "driver_compile_shader", "driver_link_program",
+        # Layer 2c: Buffer allocation
+        "allocateHelper",
     ],
     "Buffer Stuffing": [
+        # Layer 4: BufferQueue
         "dequeueBuffer", "queueBuffer", "acquireBuffer", "latchBuffer",
-        "DrawFrames", "renderFrameImpl", "flush commands", "Waiting for GPU",
+        # Layer 2: RenderThread upstream
+        "DrawFrames", "renderFrameImpl", "flush commands",
+        "eglSwapBuffers", "Waiting for GPU",
+        # Layer 5: SF downstream
+        "latchBuffers", "onMessageRefresh",
     ],
     "SurfaceFlinger CPU Deadline Missed": [
-        "onMessageRefresh", "commit", "composite", "RenderEngine",
-        "handleTransaction", "handleComposition", "postComposition",
+        # Layer 5: SF main loop
+        "onMessageRefresh", "commit", "composite",
+        "handleTransaction", "handleComposition",
+        "latchBuffers", "rebuildLayerStacks",
+        "prepareFrame", "chooseCompositionStrategy",
+        "finishFrame", "composeSurfaces",
+        "postComposition", "postFramebuffer",
+        "present",
+        # Layer 6: RenderEngine (GPU compositing fallback)
+        "RenderEngine", "REThreaded::drawLayers",
+        "SkiaGL::drawLayers",
     ],
     "Display HAL": [
-        "presentFence", "presentDisplay", "composer", "hwc",
-        "crtc_commit", "waiting for presentFence",
+        # Layer 5: SF fence
+        "presentFence", "waiting for presentFence",
+        "present", "postComposition",
+        # Layer 7: HWC/Display
+        "presentDisplay", "composer", "hwc",
+        "HwcPresentOrValidateDisplay",
+        "HWDeviceDRM", "AtomicCommit", "DRMAtomicReq",
+        "crtc_commit", "PerformCommit",
+        # Layer 7b: HWC release
+        "waitForever",
     ],
-    "Prediction Error": ["Expected Timeline", "Actual Timeline", "VSync"],
-    "SurfaceFlinger Scheduling": ["surfaceflinger", "onMessageRefresh", "sched"],
+    "Prediction Error": [
+        "Expected Timeline", "Actual Timeline", "VSync",
+    ],
+    "SurfaceFlinger Scheduling": [
+        "surfaceflinger", "onMessageRefresh", "sched",
+        "Runnable",
+    ],
 }
 
 FOCUS_TRACK_BY_JANK_TYPE = {
