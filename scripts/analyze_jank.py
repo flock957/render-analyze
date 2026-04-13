@@ -602,8 +602,8 @@ def _build_pin_patterns(target, app_main, app_render, app_hwui,
     # Always try bare "RenderThread" as fallback (may pin multiple RTs, that's OK)
     patterns.append("RenderThread")
 
-    # 4. App hwuiTask (try both "name tid" and bare name)
-    for t in app_hwui[:2]:
+    # 4. App hwuiTask + GPU completion (all are part of the app rendering pipeline)
+    for t in app_hwui:
         patterns.append(f"{t['name']} {t['tid']}")
         patterns.append(t['name'])
 
