@@ -41,21 +41,37 @@ python3 -m venv .venv
 
 # 1.4 Download Playwright's Chromium (~130 MB).
 # Try the official download host first; if it fails (common in CN),
-# retry through the npmmirror (taobao) mirror automatically.
-.venv/bin/playwright install chromium || \
-  PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright \
-    .venv/bin/playwright install chromium --force
+# retry through several CN mirror URLs automatically.
+.venv/bin/playwright install chromium \
+  || PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright \
+       .venv/bin/playwright install chromium --force \
+  || PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright \
+       .venv/bin/playwright install chromium --force \
+  || PLAYWRIGHT_DOWNLOAD_HOST=https://registry.npmmirror.com/-/binary/playwright \
+       .venv/bin/playwright install chromium --force
 ```
 
 Total setup time on a fresh machine: ~1 min for the pip install,
-~30 s for the Chromium download (longer if the mirror fallback kicks in).
+~30 s for the Chromium download (longer if a mirror fallback kicks in).
 
-> **Behind the `||` fallback**: `playwright install chromium` exits
+> **How the `||` chain works**: `playwright install chromium` exits
 > non-zero on network errors (timeout, 5xx, DNS). The shell `||`
-> then retries with `PLAYWRIGHT_DOWNLOAD_HOST` pointed at the
-> `cdn.npmmirror.com` mirror (maintained by Alibaba / Taobao),
-> and `--force` makes playwright re-download cleanly even if the
-> first attempt left a partial file.
+> then retries with the next `PLAYWRIGHT_DOWNLOAD_HOST`, and `--force`
+> makes playwright re-download cleanly even if the previous attempt
+> left a partial file. The four attempts in order are:
+>
+> 1. **Official** — `playwright.download.prss.microsoft.com` (fastest when reachable)
+> 2. **npmmirror CDN path** — `https://cdn.npmmirror.com/binaries/playwright` (current canonical npmmirror path)
+> 3. **npmmirror mirrors path** — `https://npmmirror.com/mirrors/playwright` (older npmmirror path, still live as of Apr 2026)
+> 4. **npmmirror registry path** — `https://registry.npmmirror.com/-/binary/playwright` (registry-style path used by some npmmirror clients)
+>
+> Realistically all three CN URLs above are served by the same
+> Alibaba/Taobao infrastructure, so if one is down the others
+> probably are too — the multi-path chain just protects against
+> URL-scheme changes rather than provider outages. If **all four**
+> fail you're most likely on a fully air-gapped or aggressively
+> firewalled machine; see Troubleshooting below for the fully-manual
+> escape hatch.
 
 ### Reusing an existing Chromium
 
@@ -173,7 +189,8 @@ The report shows:
 | Screenshots are landscape / small text | Viewport is hard-coded to `1072×1598 @ device_scale_factor=2.0` (portrait long-shot). Don't override these unless you know what you're doing — the pin/collapse logic assumes this height. |
 | Report is empty / Phase 1 says 0 jank frames | Your trace is missing `android.surfaceflinger.frametimeline` data. Re-record with frame timeline enabled. |
 | `requirements.txt` pip install fails | Make sure Python is ≥ 3.10. Older Python can't resolve `playwright>=1.57.0`. |
-| `playwright install chromium` fails / hangs (CN network) | The Step 1.4 `\|\|` fallback should auto-retry via `cdn.npmmirror.com`. If you skipped that line, run it manually: `PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright .venv/bin/playwright install chromium --force`. |
+| `playwright install chromium` fails / hangs (CN network) | The Step 1.4 `\|\|` chain auto-retries through 3 CN mirror URLs in order. If you skipped that line, pick any one below and run it manually (append `--force` so a partial download from a prior attempt doesn't block the retry). All three are served by the same Alibaba/npmmirror infrastructure, so try them all before concluding the mirror is down: <br>`PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright .venv/bin/playwright install chromium --force` <br>`PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright .venv/bin/playwright install chromium --force` <br>`PLAYWRIGHT_DOWNLOAD_HOST=https://registry.npmmirror.com/-/binary/playwright .venv/bin/playwright install chromium --force` |
+| All four `PLAYWRIGHT_DOWNLOAD_HOST` attempts fail (fully air-gapped / hard firewall) | Download the Chromium bundle manually on a machine that has internet, and drop it into the target machine's `~/.cache/ms-playwright/` (or wherever `PLAYWRIGHT_BROWSERS_PATH` points). The bundle directory name contains the revision, e.g. `chromium_headless_shell-1208/`. Use any Chromium tarball that matches your installed `playwright` Python package version — the easiest source is to run `.venv/bin/playwright install chromium` on a free machine first and `rsync` the resulting `ms-playwright/` folder over. |
 | `xdg-open` / `open` fails on a remote box | You're on an SSH-only server without a desktop. See Step 4 — `scp` the self-contained `render_report.html` to your local machine and open it there. |
 
 ## 6. Known issues
@@ -196,10 +213,14 @@ cd render-analyze
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
-# Chromium: try official host first, fall back to CN mirror if that fails
-.venv/bin/playwright install chromium || \
-  PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright \
-    .venv/bin/playwright install chromium --force
+# Chromium: try official host first, fall back through CN mirrors if it fails
+.venv/bin/playwright install chromium \
+  || PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright \
+       .venv/bin/playwright install chromium --force \
+  || PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright \
+       .venv/bin/playwright install chromium --force \
+  || PLAYWRIGHT_DOWNLOAD_HOST=https://registry.npmmirror.com/-/binary/playwright \
+       .venv/bin/playwright install chromium --force
 
 # Replace this with your actual trace path
 TRACE=~/Downloads/my_app.perfetto-trace
