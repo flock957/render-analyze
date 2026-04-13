@@ -247,6 +247,25 @@ def main():
                 # GPU completion at the bottom.)
                 _search_and_navigate(page, "DrawFrames")
 
+                # Perfetto centers the match — RenderThread ends up in the
+                # middle of the viewport. GPU completion (2 rows) below RT
+                # then gets cut off at the bottom edge. Shift scroll down by
+                # ~160px so the pipeline is packed higher and GPU completion
+                # is fully visible at the bottom.
+                page.evaluate("""(() => {
+                    const panels = document.querySelectorAll(
+                        '[class*="scroll"], [class*="panel-container"], [class*="viewer"]'
+                    );
+                    for (const p of panels) {
+                        if (p.scrollHeight > p.clientHeight && p.clientHeight > 200) {
+                            p.scrollTop = p.scrollTop + 160;
+                            return;
+                        }
+                    }
+                    window.scrollBy(0, 160);
+                })()""")
+                time.sleep(0.5)
+
                 global_file = f"{i:02d}_{safe_name}_global.png"
                 page.screenshot(path=str(output / global_file))
                 print(f"         -> {global_file}")
