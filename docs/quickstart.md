@@ -27,38 +27,42 @@ Chromium, and the screenshot phase uses `https://ui.perfetto.dev`).
 
 ## 1. Clone and set up
 
+One command does everything — creates `.venv`, installs Python deps,
+downloads Chromium (with CN mirror fallback), runs a smoke test:
+
 ```bash
-# 1.1 Clone the portrait-longshot branch
 git clone -b feat/portrait-longshot https://github.com/flock957/render-analyze.git
 cd render-analyze
-
-# 1.2 Create a dedicated venv (do NOT reuse another project's venv)
-python3 -m venv .venv
-
-# 1.3 Install Python deps
-.venv/bin/pip install -r requirements.txt
-# (equivalent to: .venv/bin/pip install perfetto playwright Pillow)
-
-# 1.4 Download Playwright's Chromium (~130 MB).
-# Try the official download host first; if it fails (common in CN),
-# retry through the Alibaba npmmirror.
-.venv/bin/playwright install chromium \
-  || PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright \
-       .venv/bin/playwright install chromium --force
+./scripts/setup.sh
 ```
 
-Total setup time on a fresh machine: ~1 min for the pip install,
-~30 s for the Chromium download (longer if the mirror fallback kicks in).
+Total setup time on a fresh machine: ~1 min for the pip install plus
+~30 s for the Chromium download (longer if the CN mirror fallback kicks
+in). The script is **idempotent** — safe to re-run any time the
+environment feels broken.
 
-> **How the `||` fallback works**: `playwright install chromium`
-> exits non-zero on network errors (timeout, 5xx, DNS). The shell
-> `||` then retries with `PLAYWRIGHT_DOWNLOAD_HOST` pointed at
-> `https://cdn.npmmirror.com/binaries/playwright` (the Alibaba /
-> Taobao `npmmirror` CDN), and `--force` makes playwright
-> re-download cleanly even if the first attempt left a partial
-> file. If both attempts fail you're most likely on a fully
-> air-gapped or aggressively firewalled machine — see the
-> Troubleshooting table below for a manual escape hatch.
+> **What `setup.sh` does, step by step**
+>
+> 1. **Python check** — verifies `python3 >= 3.10`, bails out with a
+>    clear error if not.
+> 2. **venv** — creates `.venv/` (reuses it if it already exists).
+> 3. **pip install** — installs everything in `requirements.txt`
+>    (`perfetto`, `playwright`, `Pillow`).
+> 4. **Chromium download** — tries the official
+>    `playwright.download.prss.microsoft.com` host first. If that
+>    returns non-zero (common in CN: timeout / 5xx / DNS),
+>    automatically retries with
+>    `PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright`
+>    and `--force` to clear any partial download.
+> 5. **Smoke test** — actually launches headless Chromium once via
+>    `sync_playwright()`. If this prints `SMOKE TEST PASSED` you're
+>    good. If it crashes with `Executable doesn't exist`, the download
+>    didn't land where playwright expects — see Troubleshooting.
+>
+> If both the official host and the npmmirror fallback fail you're
+> most likely on a fully air-gapped or aggressively firewalled
+> machine. See the Troubleshooting table below for the manual
+> escape hatch.
 
 ### Reusing an existing Chromium
 
@@ -197,13 +201,7 @@ The report shows:
 # Starting from an empty directory
 git clone -b feat/portrait-longshot https://github.com/flock957/render-analyze.git
 cd render-analyze
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-
-# Chromium: try official host first, fall back to the Alibaba npmmirror if it fails
-.venv/bin/playwright install chromium \
-  || PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright \
-       .venv/bin/playwright install chromium --force
+./scripts/setup.sh
 
 # Replace this with your actual trace path
 TRACE=~/Downloads/my_app.perfetto-trace
