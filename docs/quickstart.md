@@ -39,12 +39,23 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 # (equivalent to: .venv/bin/pip install perfetto playwright Pillow)
 
-# 1.4 Download Playwright's Chromium (~130 MB)
-.venv/bin/playwright install chromium
+# 1.4 Download Playwright's Chromium (~130 MB).
+# Try the official download host first; if it fails (common in CN),
+# retry through the npmmirror (taobao) mirror automatically.
+.venv/bin/playwright install chromium || \
+  PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright \
+    .venv/bin/playwright install chromium --force
 ```
 
 Total setup time on a fresh machine: ~1 min for the pip install,
-~30 s for the Chromium download.
+~30 s for the Chromium download (longer if the mirror fallback kicks in).
+
+> **Behind the `||` fallback**: `playwright install chromium` exits
+> non-zero on network errors (timeout, 5xx, DNS). The shell `||`
+> then retries with `PLAYWRIGHT_DOWNLOAD_HOST` pointed at the
+> `cdn.npmmirror.com` mirror (maintained by Alibaba / Taobao),
+> and `--force` makes playwright re-download cleanly even if the
+> first attempt left a partial file.
 
 ### Reusing an existing Chromium
 
@@ -121,12 +132,24 @@ need the `screenshots/` folder.
 Any modern browser works:
 
 ```bash
-# Linux
+# Linux (local desktop)
 xdg-open /path/to/output/render_report.html
 
 # macOS
 open /path/to/output/render_report.html
 ```
+
+**Running on a remote / SSH-only box?** The report is self-contained —
+`scp` just the one HTML file to your local machine and open it there:
+
+```bash
+# From your local machine
+scp user@remote:/path/to/output/render_report.html ./
+# Then open render_report.html in your local browser
+```
+
+You do **not** need to copy the `screenshots/` directory — all images
+are base64-embedded in the HTML.
 
 The report shows:
 - **Overview**: total frames, jank frames, jank rate, type distribution
@@ -150,6 +173,8 @@ The report shows:
 | Screenshots are landscape / small text | Viewport is hard-coded to `1072×1598 @ device_scale_factor=2.0` (portrait long-shot). Don't override these unless you know what you're doing — the pin/collapse logic assumes this height. |
 | Report is empty / Phase 1 says 0 jank frames | Your trace is missing `android.surfaceflinger.frametimeline` data. Re-record with frame timeline enabled. |
 | `requirements.txt` pip install fails | Make sure Python is ≥ 3.10. Older Python can't resolve `playwright>=1.57.0`. |
+| `playwright install chromium` fails / hangs (CN network) | The Step 1.4 `\|\|` fallback should auto-retry via `cdn.npmmirror.com`. If you skipped that line, run it manually: `PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright .venv/bin/playwright install chromium --force`. |
+| `xdg-open` / `open` fails on a remote box | You're on an SSH-only server without a desktop. See Step 4 — `scp` the self-contained `render_report.html` to your local machine and open it there. |
 
 ## 6. Known issues
 
@@ -170,7 +195,11 @@ git clone -b feat/portrait-longshot https://github.com/flock957/render-analyze.g
 cd render-analyze
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-.venv/bin/playwright install chromium
+
+# Chromium: try official host first, fall back to CN mirror if that fails
+.venv/bin/playwright install chromium || \
+  PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright \
+    .venv/bin/playwright install chromium --force
 
 # Replace this with your actual trace path
 TRACE=~/Downloads/my_app.perfetto-trace
@@ -178,6 +207,7 @@ OUT=/tmp/render-out
 
 .venv/bin/python3 scripts/run_workflow.py --trace "$TRACE" --output-dir "$OUT"
 
+# On a local desktop — or scp render_report.html to your laptop if remote
 xdg-open "$OUT/render_report.html"   # or `open` on macOS
 ```
 
