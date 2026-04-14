@@ -92,3 +92,34 @@ skills/workflow.md  ←  (每次跑) 三 phase 工作流
 ```
 
 `setup-environment` skill 是一次性操作,跑完之后所有后续 workflow 都复用同一个 `.venv` + Chromium 缓存。
+
+## Offline / Windows 模式 (`scripts/setup_offline.py`)
+
+在线模式的 `setup.sh` 是 bash 脚本 + 依赖 pypi / playwright CDN,
+**Windows 用户 + 内网用户两类场景都不能用**。为这两类场景提供了
+一个单独的 offline installer:
+
+- **入口**: `python3 scripts/setup_offline.py`(或 Windows 下双击
+  `scripts\setup_offline.bat`)
+- **前置**: 必须先从 GitHub Releases 下载一个 offline bundle tarball
+  (见 `docs/quickstart.md` 里的 Offline 章节),每个 bundle 对应一个
+  (OS, Python minor version) 组合,内含:
+  - `wheels/` 预下载的所有 Python wheel(对应目标 OS + Python 版本)
+  - `vendor/ms-playwright/` 预下载的 Chromium headless shell
+- **行为**: pip 用 `--no-index --find-links wheels/` 100% 离线安装,
+  chromium 通过 `run_workflow.py` 顶部的 auto-detection 自动被识别
+  到 `vendor/ms-playwright/`,不需要用户手动 export 任何环境变量
+- **跨平台**: 纯 Python,没有 bash 依赖,Linux 和 Windows 都跑
+
+## 维护者:构建 bundle (`scripts/build_offline_bundle.py`)
+
+维护者在一台**有外网访问**的 Linux 机器上跑一次,产出所有 6 个
+combination 的 bundle:
+
+```bash
+python3 scripts/build_offline_bundle.py --all
+```
+
+产出到 `./dist/`,按需上传到 GitHub Releases。详细维护者流程见
+`docs/quickstart.md` 的 "Building a new bundle (maintainers only)"
+小节。

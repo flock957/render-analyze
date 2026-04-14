@@ -25,3 +25,8 @@ Thumbs.db
 
 # Workflow output (varies per run; users pass --output-dir)
 render_output*/
+
+# Offline bundle assembly: the bundle build script creates these
+# inside the temp work tree, but they should never end up committed.
+wheels/
+vendor/
