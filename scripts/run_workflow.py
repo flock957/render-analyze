@@ -16,6 +16,7 @@ Usage:
   python3 run_workflow.py --trace /path/to/trace --output-dir /out --no-screenshots
 """
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -23,6 +24,21 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
 PYTHON = sys.executable
+
+# ── Offline bundle auto-detection ─────────────────────────────────
+# If the repo ships a vendored Chromium and/or trace_processor under
+# `vendor/` (the layout produced by `scripts/build_offline_bundle.py`),
+# wire them into the environment so subprocesses inherit the right
+# paths. Online mode is unaffected — this is a no-op if vendor/ is
+# absent.
+_REPO_ROOT = SCRIPT_DIR.parent
+_VENDOR_PW = _REPO_ROOT / "vendor" / "ms-playwright"
+if _VENDOR_PW.is_dir():
+    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(_VENDOR_PW))
+_tp_binary = "trace_processor.exe" if sys.platform == "win32" else "trace_processor"
+_VENDOR_TP = _REPO_ROOT / "vendor" / _tp_binary
+if _VENDOR_TP.is_file():
+    os.environ["PATH"] = f"{_VENDOR_TP.parent}{os.pathsep}{os.environ.get('PATH', '')}"
 
 
 def banner(phase, title, detail=""):
