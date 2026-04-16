@@ -96,6 +96,20 @@ reports:
 3. **trace 路径来自输入表单的 `{{trace_path}}`**，不要猜测
 4. **遇到脚本错误立即停止并报告**
 
+### 内网部署注意
+
+`capture_screenshots.py` 默认访问公网 `https://ui.perfetto.dev`。内网部署
+（如荣耀内网）无法访问公网时，通过环境变量切到内网自部署的 Perfetto UI:
+
+```bash
+export PERFETTO_UI_URL=https://perfetto.rnd.hihonor.com/
+```
+
+外网环境不用设置这个变量，脚本默认就用 `ui.perfetto.dev`。内网环境如果
+没设置会导致 `page.goto` 超时，最终截到的是 Perfetto UI 加载初始化时的
+空白画面（trace 根本没加载进去）。如果你所在的 OpenHands 部署把这个变量
+注入到 sandbox，所有命令会自动继承，不需要每条命令手动 export。
+
 ### 执行步骤
 
 | 阶段 | 脚本 | 说明 |

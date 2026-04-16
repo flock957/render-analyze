@@ -91,8 +91,15 @@ def main():
             )
 
             # --- Load Perfetto UI (will auto-detect RPC server) ---
-            print("  [2.1] Loading Perfetto UI...")
-            page.goto("https://ui.perfetto.dev")
+            # URL is configurable via PERFETTO_UI_URL env var for intranet
+            # deployments where the public ui.perfetto.dev is unreachable
+            # (e.g. corporate firewall). Default is the public instance,
+            # so external users don't need to set anything.
+            perfetto_ui_url = os.environ.get(
+                "PERFETTO_UI_URL", "https://ui.perfetto.dev"
+            )
+            print(f"  [2.1] Loading Perfetto UI: {perfetto_ui_url}")
+            page.goto(perfetto_ui_url)
             page.wait_for_load_state("networkidle")
             time.sleep(2)
             _dismiss_cookie(page)
