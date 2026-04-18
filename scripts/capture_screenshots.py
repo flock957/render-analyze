@@ -35,6 +35,17 @@ DEVICE_SCALE_FACTOR = 2.0
 TRACE_PROCESSOR_PORT = 9001
 
 
+def _scaled_timeout(size_mb: int, baseline_sec: int, per_mb_sec: float) -> int:
+    """Scale a timeout by trace file size.
+
+    Small traces keep the baseline; larger traces get proportionally more
+    time. Returns seconds. Used for RPC readiness probing and Perfetto UI
+    trace-load waiting so the hardcoded 60s / 120s ceilings stop being a
+    fragile cap once traces grow past ~200MB.
+    """
+    return max(baseline_sec, int(size_mb * per_mb_sec))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Capture Perfetto trace screenshots")
     parser.add_argument("--trace", required=True)
@@ -80,7 +91,7 @@ def main():
     # --- Start trace_processor HTTP RPC server (loads trace ONCE) ---
     size_mb = trace.stat().st_size // 1024 // 1024
     print(f"  [2.0] Starting trace_processor HTTP RPC for {size_mb}MB trace...")
-    tp_proc = _start_trace_processor(trace, args.trace_processor)
+    tp_proc = _start_trace_processor(trace, args.trace_processor, size_mb=size_mb)
 
     try:
         with sync_playwright() as p:
@@ -137,8 +148,17 @@ def main():
                     except: pass
 
             if not rpc_used:
-                # Fall back to file upload
-                print("         Using file upload...")
+                # Fall back to file upload. If we started a tp_proc above
+                # but the UI never picked it up, that's a silent failure
+                # worth surfacing: the RPC server wastes memory and the
+                # slower file-upload path runs anyway.
+                if tp_proc is not None:
+                    print("         WARNING: trace_processor RPC was started but "
+                          "Perfetto UI did not auto-detect it.")
+                    print("                  Falling back to file upload. The RPC "
+                          "server is idle but still resident in memory.")
+                else:
+                    print("         Using file upload...")
                 try:
                     with page.expect_file_chooser(timeout=5000) as fc:
                         page.click("text=Open trace file")
@@ -148,11 +168,15 @@ def main():
                     raise
 
             # --- Wait for trace to be fully loaded (DOM-based, not sleep) ---
-            print("  [2.2.1] Waiting for trace to be ready...")
+            # Timeout scales with trace size. Observed 400MB via file upload
+            # takes ~19s; per_mb_sec=0.6 gives 240s at 400MB (12× safety)
+            # and 960s at 1.6GB.
+            trace_ready_timeout = _scaled_timeout(size_mb, baseline_sec=120, per_mb_sec=0.6)
+            print(f"  [2.2.1] Waiting for trace to be ready (timeout {trace_ready_timeout}s)...")
             try:
                 page.wait_for_function(
                     "() => window.app && window.app._activeTrace && window.app._activeTrace.timeline",
-                    timeout=120000,
+                    timeout=trace_ready_timeout * 1000,
                 )
                 print(f"         Trace ready in {time.time()-t0:.1f}s ({'RPC' if rpc_used else 'file upload'})")
             except Exception as e:
@@ -369,7 +393,7 @@ def main():
 
 # ─── trace_processor HTTP RPC management ──────────────────────────────
 
-def _start_trace_processor(trace_path, override_bin=None):
+def _start_trace_processor(trace_path, override_bin=None, size_mb=0):
     """Start trace_processor in HTTP RPC mode and wait for it to be ready.
 
     Discovery order for the binary:
@@ -378,6 +402,10 @@ def _start_trace_processor(trace_path, override_bin=None):
 
     Returns None if no binary is found, in which case the caller falls
     back to in-browser file upload mode.
+
+    `size_mb` scales the readiness-wait timeout: trace_processor's socket
+    opens fast (it's lazy), but on slow IO or very large files the status
+    probe can still race. For small traces the 60s baseline applies.
     """
     import shutil
     bin_path = override_bin or shutil.which("trace_processor")
@@ -401,10 +429,11 @@ def _start_trace_processor(trace_path, override_bin=None):
         start_new_session=True,
     )
 
-    # Wait for HTTP server to be ready (poll /status)
+    # Wait for HTTP server to be ready (poll /status). Scale for large files.
+    rpc_timeout = _scaled_timeout(size_mb, baseline_sec=60, per_mb_sec=0.15)
     import socket
     t0 = time.time()
-    while time.time() - t0 < 60:
+    while time.time() - t0 < rpc_timeout:
         try:
             with socket.create_connection(("127.0.0.1", TRACE_PROCESSOR_PORT), timeout=1):
                 # Server is up, but trace might still be loading
@@ -421,7 +450,7 @@ def _start_trace_processor(trace_path, override_bin=None):
         except: pass
         time.sleep(0.5)
 
-    print(f"         WARNING: trace_processor RPC not ready after 60s")
+    print(f"         WARNING: trace_processor RPC not ready after {rpc_timeout}s")
     return proc
 
 
