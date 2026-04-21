@@ -34,6 +34,279 @@ DEVICE_SCALE_FACTOR = 2.0
 # but functionally equivalent.
 TRACE_PROCESSOR_PORT = 9001
 
+NS_PER_MS = 1_000_000
+DETAIL_LEFT_MIN_NS = 40 * NS_PER_MS
+DETAIL_LEFT_MAX_NS = 90 * NS_PER_MS
+DETAIL_RIGHT_MIN_NS = 100 * NS_PER_MS
+DETAIL_RIGHT_MAX_NS = 220 * NS_PER_MS
+
+IGNORED_EVIDENCE_THREAD_TOKENS = (
+    "heaptaskdaemon",
+    "finalizer",
+    "referencequeue",
+    "profile saver",
+    "signal catcher",
+)
+
+IGNORED_EVIDENCE_SLICE_TOKENS = (
+    "binder transaction",
+    "concurrent copying gc",
+    "young concurrent copying gc",
+    "background concurrent copying gc",
+    "background young concurrent copying gc",
+)
+
+
+def _scaled_timeout(size_mb: int, baseline_sec: int, per_mb_sec: float) -> int:
+    return max(baseline_sec, int(size_mb * per_mb_sec))
+
+
+def _append_unique_pattern(patterns, seen, pattern):
+    text = str(pattern or "").strip()
+    if not text or text in seen:
+        return
+    patterns.append(text)
+    seen.add(text)
+
+
+def _append_thread_entry_patterns(patterns, seen, entry, include_name=False):
+    if not entry:
+        return
+    name = str(entry.get("name", "")).strip()
+    tid = entry.get("tid")
+    if name and tid:
+        _append_unique_pattern(patterns, seen, f"{name} {tid}")
+    if include_name and name:
+        _append_unique_pattern(patterns, seen, name)
+
+
+def _pick_thread_entries(entries, preferred_tokens, limit=1):
+    if not entries:
+        return []
+    picked = []
+    seen = set()
+    for token in [str(token or "").strip().lower() for token in preferred_tokens]:
+        if not token:
+            continue
+        for entry in entries:
+            name = str(entry.get("name", "")).strip()
+            key = (name, entry.get("tid"))
+            if key in seen:
+                continue
+            if token in name.lower():
+                picked.append(entry)
+                seen.add(key)
+                if len(picked) >= limit:
+                    return picked
+    for entry in entries:
+        name = str(entry.get("name", "")).strip()
+        key = (name, entry.get("tid"))
+        if not name or key in seen:
+            continue
+        picked.append(entry)
+        seen.add(key)
+        if len(picked) >= limit:
+            return picked
+    return picked
+
+
+def _should_include_evidence_thread(ev):
+    thread_name = str(ev.get("thread", "")).strip().lower()
+    slice_name = str(ev.get("name", "")).strip().lower()
+    if not thread_name:
+        return False
+    if thread_name == "gc" or thread_name.startswith("gc "):
+        return False
+    if any(token in thread_name for token in IGNORED_EVIDENCE_THREAD_TOKENS):
+        return False
+    if any(token in slice_name for token in IGNORED_EVIDENCE_SLICE_TOKENS):
+        return False
+    return True
+
+
+def _iter_relevant_evidence(frame):
+    for item in frame.get("evidence_slices", []) or []:
+        if isinstance(item, dict) and _should_include_evidence_thread(item):
+            yield item
+
+
+def _primary_span_ns(frame):
+    primary = int(frame.get("dur", 0) or 0)
+    for item in _iter_relevant_evidence(frame):
+        try:
+            primary = max(primary, int(item.get("dur_ns", 0) or 0))
+        except Exception:
+            continue
+    return max(primary, 40 * NS_PER_MS)
+
+
+def _fit_window(total_start, total_end, desired_start, desired_end):
+    total_start = int(total_start)
+    total_end = int(total_end)
+    desired_start = int(desired_start)
+    desired_end = int(desired_end)
+    if total_end <= total_start:
+        return total_start, total_end
+    width = max(1, desired_end - desired_start)
+    width = min(width, total_end - total_start)
+    start = desired_start
+    end = start + width
+    if start < total_start:
+        start = total_start
+        end = start + width
+    if end > total_end:
+        end = total_end
+        start = end - width
+    return int(start), int(end)
+
+
+def _clamp_int(value, lower, upper):
+    return max(lower, min(upper, int(value)))
+
+
+def _resolve_detail_anchor(focus_track):
+    text = str(focus_track or "").strip()
+    normalized = text.lower()
+    if not normalized:
+        return "Actual Timeline"
+    if "dequeuebuffer" in normalized:
+        return "RenderThread"
+    if "presentfence" in normalized:
+        return "surfaceflinger"
+    if "gpu completion" in normalized:
+        return "GPU completion"
+    if "surfaceflinger" in normalized:
+        return "surfaceflinger"
+    if "renderthread" in normalized:
+        return "RenderThread"
+    if "actual timeline" in normalized:
+        return "Actual Timeline"
+    return text
+
+
+def _issue_context(frame, detail_anchor):
+    jank_norm = str(frame.get("jank_type", "") or "").strip().lower()
+    anchor_norm = str(detail_anchor or "").strip().lower()
+    return {
+        "display_related": (
+            "display hal" in jank_norm
+            or "surfaceflinger" in anchor_norm
+            or "presentfence" in anchor_norm
+            or "composer" in anchor_norm
+        ),
+        "buffer_related": "buffer stuffing" in jank_norm or "dequeuebuffer" in anchor_norm,
+        "deadline_related": "app deadline missed" in jank_norm,
+        "unknown_related": "unknown jank" in jank_norm or "actual timeline" in anchor_norm,
+    }
+
+
+def _build_detail_window(frame, trace_start, trace_end, detail_anchor):
+    trace_start = int(trace_start)
+    trace_end = int(trace_end)
+    target_ts = int(frame.get("target_ts", frame.get("ts", trace_start)) or trace_start)
+    primary_span = _primary_span_ns(frame)
+    issue = _issue_context(frame, detail_anchor)
+
+    left_min = DETAIL_LEFT_MIN_NS
+    left_max = DETAIL_LEFT_MAX_NS
+    right_min = DETAIL_RIGHT_MIN_NS
+    right_max = DETAIL_RIGHT_MAX_NS
+
+    if issue["display_related"]:
+        left_min = 50 * NS_PER_MS
+        left_max = 110 * NS_PER_MS
+        right_min = 120 * NS_PER_MS
+        right_max = 260 * NS_PER_MS
+    elif issue["unknown_related"]:
+        left_min = 45 * NS_PER_MS
+        left_max = 100 * NS_PER_MS
+        right_min = 90 * NS_PER_MS
+        right_max = 180 * NS_PER_MS
+
+    left_ns = _clamp_int(max(int(primary_span * 0.45), left_min), left_min, left_max)
+    right_ns = _clamp_int(max(int(primary_span * 1.10), right_min), right_min, right_max)
+    return _fit_window(trace_start, trace_end, target_ts - left_ns, target_ts + right_ns)
+
+
+def _build_global_pin_patterns(frame, thread_map):
+    patterns = []
+    seen = set()
+    detail_anchor = _resolve_detail_anchor(frame.get("focus_track", ""))
+    issue = _issue_context(frame, detail_anchor)
+
+    _append_unique_pattern(patterns, seen, "Expected Timeline")
+    _append_unique_pattern(patterns, seen, "Actual Timeline")
+    _append_thread_entry_patterns(patterns, seen, (thread_map.get("app_main_thread") or [None])[0], include_name=False)
+    _append_thread_entry_patterns(patterns, seen, (thread_map.get("app_render_threads") or [None])[0], include_name=False)
+    _append_thread_entry_patterns(
+        patterns,
+        seen,
+        (_pick_thread_entries(thread_map.get("app_hwui_threads") or [], ("gpu completion",), limit=1) or [None])[0],
+        include_name=False,
+    )
+
+    sf_tid = thread_map.get("sf_main_tid")
+    if sf_tid:
+        _append_unique_pattern(patterns, seen, f"surfaceflinger {sf_tid}")
+    else:
+        _append_unique_pattern(patterns, seen, "surfaceflinger")
+
+    if issue["display_related"]:
+        for entry in _pick_thread_entries(thread_map.get("hwc_threads") or [], ("composer", "hwc", "overlay"), limit=2):
+            _append_thread_entry_patterns(patterns, seen, entry, include_name=False)
+        for entry in _pick_thread_entries(
+            (thread_map.get("sf_render_engine") or []) + (thread_map.get("sf_gpu_completion") or []),
+            ("renderengine", "gpu completion"),
+            limit=2,
+        ):
+            _append_thread_entry_patterns(patterns, seen, entry, include_name=False)
+    return patterns
+
+
+def _build_detail_pin_patterns(frame, thread_map, detail_anchor):
+    patterns = []
+    seen = set()
+    issue = _issue_context(frame, detail_anchor)
+
+    _append_unique_pattern(patterns, seen, "Expected Timeline")
+    _append_unique_pattern(patterns, seen, "Actual Timeline")
+    _append_thread_entry_patterns(patterns, seen, (thread_map.get("app_main_thread") or [None])[0], include_name=False)
+    _append_thread_entry_patterns(patterns, seen, (thread_map.get("app_render_threads") or [None])[0], include_name=False)
+    _append_thread_entry_patterns(
+        patterns,
+        seen,
+        (_pick_thread_entries(thread_map.get("app_hwui_threads") or [], ("gpu completion",), limit=1) or [None])[0],
+        include_name=False,
+    )
+
+    if issue["display_related"]:
+        sf_tid = thread_map.get("sf_main_tid")
+        if sf_tid:
+            _append_unique_pattern(patterns, seen, f"surfaceflinger {sf_tid}")
+        else:
+            _append_unique_pattern(patterns, seen, "surfaceflinger")
+        for entry in _pick_thread_entries(thread_map.get("hwc_threads") or [], ("composer", "hwc", "overlay"), limit=1):
+            _append_thread_entry_patterns(patterns, seen, entry, include_name=False)
+    return patterns
+
+
+def _apply_pin_patterns(page, patterns):
+    _cmd(page, 'dev.perfetto.UnpinAllTracks')
+    time.sleep(0.2)
+    _cmd(page, 'dev.perfetto.CollapseAllGroups')
+    time.sleep(0.2)
+    for pattern in patterns:
+        _cmd(page, 'dev.perfetto.PinTracksByRegex', pattern)
+        time.sleep(0.15)
+    _cmd(page, 'dev.perfetto.ExpandTracksByRegex', 'Expected Timeline')
+    time.sleep(0.15)
+    _cmd(page, 'dev.perfetto.ExpandTracksByRegex', 'Actual Timeline')
+    time.sleep(0.15)
+    for _ in range(3):
+        page.keyboard.press("Escape")
+        time.sleep(0.1)
+    _force_hide_ui_noise(page)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Capture Perfetto trace screenshots")
@@ -80,14 +353,15 @@ def main():
     # --- Start trace_processor HTTP RPC server (loads trace ONCE) ---
     size_mb = trace.stat().st_size // 1024 // 1024
     print(f"  [2.0] Starting trace_processor HTTP RPC for {size_mb}MB trace...")
-    tp_proc = _start_trace_processor(trace, args.trace_processor)
+    tp_proc = _start_trace_processor(trace, args.trace_processor, size_mb=size_mb)
 
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=['--no-sandbox'])
+            browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--ignore-certificate-errors'])
             page = browser.new_page(
                 viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
                 device_scale_factor=DEVICE_SCALE_FACTOR,
+                ignore_https_errors=True,
             )
 
             # --- Load Perfetto UI (will auto-detect RPC server) ---
@@ -137,8 +411,11 @@ def main():
                     except: pass
 
             if not rpc_used:
-                # Fall back to file upload
-                print("         Using file upload...")
+                if tp_proc is not None:
+                    print("         WARNING: trace_processor RPC was started but Perfetto UI did not auto-detect it.")
+                    print("                  Falling back to file upload. The RPC server is idle but still resident in memory.")
+                else:
+                    print("         Using file upload...")
                 try:
                     with page.expect_file_chooser(timeout=5000) as fc:
                         page.click("text=Open trace file")
@@ -148,11 +425,12 @@ def main():
                     raise
 
             # --- Wait for trace to be fully loaded (DOM-based, not sleep) ---
-            print("  [2.2.1] Waiting for trace to be ready...")
+            trace_ready_timeout = _scaled_timeout(size_mb, baseline_sec=120, per_mb_sec=0.6)
+            print(f"  [2.2.1] Waiting for trace to be ready (timeout {trace_ready_timeout}s)...")
             try:
                 page.wait_for_function(
                     "() => window.app && window.app._activeTrace && window.app._activeTrace.timeline",
-                    timeout=120000,
+                    timeout=trace_ready_timeout * 1000,
                 )
                 print(f"         Trace ready in {time.time()-t0:.1f}s ({'RPC' if rpc_used else 'file upload'})")
             except Exception as e:
@@ -206,118 +484,61 @@ def main():
                 _cmd(page, 'dev.perfetto.CollapseAllGroups')
                 time.sleep(0.5)
 
-                # Step 3: Pin ONLY SF main thread + composer (compact pinned area).
-                # Use exact "surfaceflinger {tid}" to avoid pinning all SF sub-threads.
-                sf_tid = thread_map.get('sf_main_tid', '')
-                if sf_tid:
-                    _cmd(page, 'dev.perfetto.PinTracksByRegex', f'surfaceflinger {sf_tid}')
-                    time.sleep(0.2)
-                _cmd(page, 'dev.perfetto.PinTracksByRegex', 'composer-servic')
-                time.sleep(0.2)
-                page.keyboard.press("Escape")
-                time.sleep(0.2)
-                page.keyboard.press("Escape")
-                time.sleep(0.2)
-
-                # Step 4: Selectively expand target process + Frame Timeline
-                _cmd(page, 'dev.perfetto.ExpandTracksByRegex', target['process_name'])
-                time.sleep(0.5)
-                _cmd(page, 'dev.perfetto.ExpandTracksByRegex', str(target['pid']))
-                time.sleep(0.5)
-                _cmd(page, 'dev.perfetto.ExpandTracksByRegex', 'Expected Timeline')
-                time.sleep(0.5)
-                _cmd(page, 'dev.perfetto.ExpandTracksByRegex', 'Actual Timeline')
-                time.sleep(0.5)
-                page.keyboard.press("Escape")
-                time.sleep(0.2)
-
-                # Step 5: Collapse noise (system + non-target process groups)
+                # Step 3: Collapse noise (system groups stay hidden below pinned tracks)
                 for noise in ['CPU Scheduling', 'CPU Frequency', 'Ftrace',
                               'GPU', 'Scheduler', 'System', 'Kernel']:
                     _cmd(page, 'dev.perfetto.CollapseTracksByRegex', noise)
                     time.sleep(0.1)
 
-                # Step 6: Force-hide sidebar + bottom panel + cookie via CSS
+                # Step 4: Force-hide sidebar + bottom panel + cookie via CSS
                 _force_hide_ui_noise(page)
 
                 # ── GLOBAL screenshot ────────────────────────────
+                detail_anchor = _resolve_detail_anchor(focus_track)
+                global_patterns = _build_global_pin_patterns(frame, thread_map)
+                _apply_pin_patterns(page, global_patterns)
                 global_start = int(tp_state["trace_start"])
                 global_end = int(tp_state["trace_end"])
                 _zoom_to(page, global_start, global_end)
                 time.sleep(5)
                 _force_hide_ui_noise(page)
 
-                # Search "DrawFrames" to center on RenderThread.
-                # This puts main thread ABOVE and GPU completion BELOW in view,
-                # covering the full Frame Timeline: main → RT → GPU completion.
-                # (Searching "Choreographer" puts main thread at top, cutting off
-                # GPU completion at the bottom.)
-                _search_and_navigate(page, "DrawFrames")
-
-                # Perfetto centers the match — RenderThread ends up in the
-                # middle of the viewport. GPU completion (2 rows) below RT
-                # then gets cut off at the bottom edge. Shift scroll down by
-                # ~160px so the pipeline is packed higher and GPU completion
-                # is fully visible at the bottom.
-                page.evaluate("""(() => {
-                    const panels = document.querySelectorAll(
-                        '[class*="scroll"], [class*="panel-container"], [class*="viewer"]'
-                    );
-                    for (const p of panels) {
-                        if (p.scrollHeight > p.clientHeight && p.clientHeight > 200) {
-                            p.scrollTop = p.scrollTop + 160;
-                            return;
-                        }
-                    }
-                    window.scrollBy(0, 160);
-                })()""")
-                time.sleep(0.5)
-
                 global_file = f"{i:02d}_{safe_name}_global.png"
-                page.screenshot(path=str(output / global_file))
+                _take_validated_screenshot(
+                    page,
+                    output / global_file,
+                    'surfaceflinger' if any('surfaceflinger' in p.lower() for p in global_patterns) else detail_anchor,
+                    track_hints=global_patterns,
+                    height_ratio=0.78,
+                    prefer_focus=False,
+                    retry_wait_sec=4,
+                )
                 print(f"         -> {global_file}")
 
-                # Save scroll position (Frame Timeline area)
-                saved_scroll = page.evaluate("""(() => {
-                    const panels = document.querySelectorAll(
-                        '[class*="scroll"], [class*="panel-container"], [class*="viewer"]'
-                    );
-                    for (const p of panels) {
-                        if (p.scrollHeight > p.clientHeight && p.clientHeight > 200) {
-                            return {top: p.scrollTop, height: p.scrollHeight};
-                        }
-                    }
-                    return {top: window.scrollY, height: document.body.scrollHeight};
-                })()""")
-
                 # ── DETAIL screenshot ────────────────────────────
-                detail_window = max(int(dur * 2), 80_000_000)
-                detail_start = target_ts - detail_window
-                detail_end = target_ts + detail_window
+                detail_patterns = _build_detail_pin_patterns(frame, thread_map, detail_anchor)
+                _apply_pin_patterns(page, detail_patterns)
+                detail_start, detail_end = _build_detail_window(
+                    frame,
+                    int(tp_state["trace_start"]),
+                    int(tp_state["trace_end"]),
+                    detail_anchor,
+                )
                 _zoom_to(page, detail_start, detail_end)
                 time.sleep(3)
-
-                # Restore scroll to Frame Timeline area
-                page.evaluate(f"""(() => {{
-                    const panels = document.querySelectorAll(
-                        '[class*="scroll"], [class*="panel-container"], [class*="viewer"]'
-                    );
-                    for (const p of panels) {{
-                        if (p.scrollHeight > p.clientHeight && p.clientHeight > 200) {{
-                            p.scrollTop = {saved_scroll.get('top', 0)};
-                            return;
-                        }}
-                    }}
-                    window.scrollTo(0, {saved_scroll.get('top', 0)});
-                }})()""")
-                time.sleep(1.5)
 
                 _click_slice_at(page, target_ts, detail_start, detail_end)
                 time.sleep(0.4)
                 _force_hide_ui_noise(page)
 
                 detail_file = f"{i:02d}_{safe_name}_detail.png"
-                page.screenshot(path=str(output / detail_file))
+                _take_validated_screenshot(
+                    page,
+                    output / detail_file,
+                    detail_anchor,
+                    track_hints=detail_patterns,
+                    height_ratio=0.68,
+                )
 
                 # Annotate with highlight box + title bar
                 evidence = frame.get("evidence_slices", [])
@@ -325,6 +546,8 @@ def main():
                     output / detail_file,
                     target_ts, detail_start, detail_end,
                     jank_type, evidence,
+                    focus_track=detail_anchor,
+                    track_hints=detail_patterns,
                 )
                 print(f"         -> {detail_file} (annotated)")
 
@@ -369,7 +592,7 @@ def main():
 
 # ─── trace_processor HTTP RPC management ──────────────────────────────
 
-def _start_trace_processor(trace_path, override_bin=None):
+def _start_trace_processor(trace_path, override_bin=None, size_mb=0):
     """Start trace_processor in HTTP RPC mode and wait for it to be ready.
 
     Discovery order for the binary:
@@ -401,10 +624,11 @@ def _start_trace_processor(trace_path, override_bin=None):
         start_new_session=True,
     )
 
-    # Wait for HTTP server to be ready (poll /status)
+    # Wait for HTTP server to be ready (poll /status). Scale for large traces.
     import socket
+    rpc_timeout = _scaled_timeout(size_mb, baseline_sec=60, per_mb_sec=0.15)
     t0 = time.time()
-    while time.time() - t0 < 60:
+    while time.time() - t0 < rpc_timeout:
         try:
             with socket.create_connection(("127.0.0.1", TRACE_PROCESSOR_PORT), timeout=1):
                 # Server is up, but trace might still be loading
@@ -421,7 +645,7 @@ def _start_trace_processor(trace_path, override_bin=None):
         except: pass
         time.sleep(0.5)
 
-    print(f"         WARNING: trace_processor RPC not ready after 60s")
+    print(f"         WARNING: trace_processor RPC not ready after {rpc_timeout}s")
     return proc
 
 
@@ -569,6 +793,7 @@ def _force_hide_ui_noise(page):
         })()""")
     except:
         pass
+    _hide_noise_track_groups(page)
 
 
 def _collapse_bottom_panel(page):
@@ -719,12 +944,219 @@ def _click_slice_at(page, target_ts, vis_start_ns, vis_end_ns):
         pass
 
 
-def _annotate_detail(filepath, target_ts, vis_start, vis_end, jank_type, evidence):
-    """Overlay a bounded highlight rectangle + title bar on detail screenshot.
+def _hide_noise_track_groups(page):
+    try:
+        page.evaluate(
+            """() => {
+                const noise = new Set([
+                    'cpu scheduling',
+                    'cpu frequency',
+                    'scheduler',
+                    'kernel threads',
+                    'android logs',
+                    'android app startups',
+                    'ftrace events',
+                    'power',
+                    'memory',
+                    'cpu',
+                    'system',
+                    'gpu',
+                    'io',
+                    'device state',
+                ]);
+                const els = document.querySelectorAll(
+                    '[class*="track-shell"], [class*="trackShell"], ' +
+                    '[class*="track-name"], [class*="trackName"], [class*="pf-track"]'
+                );
+                for (const el of els) {
+                    const text = (el.textContent || '').trim().toLowerCase();
+                    if (!noise.has(text)) continue;
+                    let node = el;
+                    for (let i = 0; i < 4 && node.parentElement; i += 1) {
+                        const parent = node.parentElement;
+                        const r = parent.getBoundingClientRect();
+                        if (r.height > 10 && r.height < 44 && r.width > 120) {
+                            node = parent;
+                        } else {
+                            break;
+                        }
+                    }
+                    try { node.style.display = 'none'; } catch (e) {}
+                }
+            }"""
+        )
+    except Exception:
+        pass
 
-    The rectangle has clear top/bottom/left/right borders covering the pinned
-    tracks area (roughly top 40% of the image) at the x-position of target_ts.
-    """
+
+def _pick_title_evidence(evidence, focus_track="", track_hints=None):
+    focus_tokens = []
+    if focus_track:
+        focus_tokens.append(str(focus_track).strip().lower())
+    for item in track_hints or []:
+        text = str(item or "").strip().lower()
+        if not text:
+            continue
+        focus_tokens.append(text)
+        parts = text.rsplit(" ", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            focus_tokens.append(parts[0].strip())
+
+    best = None
+    best_score = -10**9
+    for idx, ev in enumerate(evidence or []):
+        thread_name = str(ev.get("thread", "")).strip().lower()
+        slice_name = str(ev.get("name", "")).strip().lower()
+        score = -idx
+        if _should_include_evidence_thread(ev):
+            score += 100
+        else:
+            score -= 200
+        matched_focus = any(token and (token in thread_name or token in slice_name) for token in focus_tokens)
+        if matched_focus:
+            score += 40
+        elif focus_tokens:
+            score -= 20
+        if any(token in slice_name for token in ("drawframes", "traversal", "dequeuebuffer", "waiting for gpu completion", "draw-vri", "doframe")):
+            score += 18
+        if "binder transaction" in slice_name:
+            score -= 25
+        if score > best_score:
+            best = ev
+            best_score = score
+    return best or (evidence[0] if evidence else None)
+
+
+def _trim_bottom_idle_rows(filepath, scan_start_ratio=0.28, min_active_pixels=20, bottom_margin=3, min_active_streak=3):
+    try:
+        from PIL import Image
+    except Exception:
+        return
+
+    try:
+        with Image.open(str(filepath)).convert("RGB") as img:
+            width, height = img.size
+            if width < 200 or height < 200:
+                return
+
+            x0 = max(0, min(width - 1, int(width * scan_start_ratio)))
+            y_floor = max(0, int(height * 0.45))
+            sample_x0 = max(x0, int(width * 0.85))
+            sample_y0 = max(0, height - 16)
+
+            bg_samples = []
+            for y in range(sample_y0, height):
+                for x in range(sample_x0, width):
+                    bg_samples.append(img.getpixel((x, y)))
+            if not bg_samples:
+                return
+
+            bg_r = sum(pixel[0] for pixel in bg_samples) / len(bg_samples)
+            bg_g = sum(pixel[1] for pixel in bg_samples) / len(bg_samples)
+            bg_b = sum(pixel[2] for pixel in bg_samples) / len(bg_samples)
+
+            def is_active(pixel):
+                return (
+                    abs(pixel[0] - bg_r) + abs(pixel[1] - bg_g) + abs(pixel[2] - bg_b)
+                ) >= 52
+
+            last_active_y = None
+            step = 2 if width >= 1200 else 1
+            active_streak = 0
+            active_block_end = None
+            for y in range(height - 1, y_floor - 1, -1):
+                active = 0
+                for x in range(x0, width, step):
+                    if is_active(img.getpixel((x, y))):
+                        active += 1
+                        if active >= min_active_pixels:
+                            break
+                if active >= min_active_pixels:
+                    if active_streak == 0:
+                        active_block_end = y
+                    active_streak += 1
+                    if active_streak >= min_active_streak:
+                        last_active_y = active_block_end
+                        break
+                else:
+                    active_streak = 0
+                    active_block_end = None
+
+            if last_active_y is None:
+                return
+
+            crop_bottom = min(height, max(last_active_y + bottom_margin, y_floor + 40))
+            if crop_bottom >= height - 8:
+                return
+
+            trimmed = img.crop((0, 0, width, crop_bottom))
+            trimmed.save(str(filepath))
+    except Exception:
+        return
+
+
+def _image_has_signal(filepath, scan_start_ratio=0.20, ignore_top_ratio=0.12, min_ratio=0.02):
+    try:
+        from PIL import Image
+    except Exception:
+        return True
+
+    try:
+        with Image.open(str(filepath)).convert("RGB") as img:
+            width, height = img.size
+            if width < 200 or height < 200:
+                return True
+
+            x0 = max(0, min(width - 1, int(width * scan_start_ratio)))
+            y0 = max(0, min(height - 1, int(height * ignore_top_ratio)))
+            x_step = max(1, (width - x0) // 36)
+            y_step = max(1, (height - y0) // 24)
+            bg = img.getpixel((width - 10, height - 10))
+
+            total = 0
+            active = 0
+            for y in range(y0, height, y_step):
+                for x in range(x0, width, x_step):
+                    total += 1
+                    pixel = img.getpixel((x, y))
+                    if sum(abs(pixel[i] - bg[i]) for i in range(3)) >= 48:
+                        active += 1
+            if total == 0:
+                return True
+            return (active / total) >= min_ratio
+    except Exception:
+        return True
+
+
+def _take_validated_screenshot(page, filepath, anchor_track, track_hints=None, height_ratio=0.72, prefer_focus=True, retry_wait_sec=0):
+    strategies = []
+    if prefer_focus:
+        strategies.append(("focus", lambda: _take_focus_screenshot(
+            page, filepath, anchor_track, track_hints=track_hints, height_ratio=height_ratio
+        )))
+    strategies.append(("clip", lambda: _take_clipped_screenshot(page, filepath, anchor_track)))
+    if not prefer_focus:
+        strategies.append(("focus", lambda: _take_focus_screenshot(
+            page, filepath, anchor_track, track_hints=track_hints, height_ratio=height_ratio
+        )))
+
+    rounds = 2 if retry_wait_sec > 0 else 1
+    for round_idx in range(rounds):
+        if round_idx:
+            time.sleep(retry_wait_sec)
+            _force_hide_ui_noise(page)
+            print(f"         waiting {retry_wait_sec}s and retrying screenshot...")
+        for name, fn in strategies:
+            fn()
+            if _image_has_signal(filepath):
+                return
+            print(f"         [{name}] captured low-signal image, retrying...")
+
+    page.screenshot(path=str(filepath))
+    _trim_bottom_idle_rows(filepath)
+
+
+def _annotate_detail(filepath, target_ts, vis_start, vis_end, jank_type, evidence, focus_track="", track_hints=None):
     try:
         from PIL import Image, ImageDraw, ImageFont
     except ImportError:
@@ -743,41 +1175,30 @@ def _annotate_detail(filepath, target_ts, vis_start, vis_end, jank_type, evidenc
         gutter = int(w * 0.18)
         track_w = w - gutter
         center_x = gutter + int(track_w * ts_ratio)
-        half_w = max(int(track_w * 0.06), 50)
+        half_w = max(int(track_w * 0.008), 6)
 
         x_left = max(gutter, center_x - half_w)
         x_right = min(w - 10, center_x + half_w)
 
-        # Bounded rectangle: top = below title bar, bottom = ~45% of image height
-        # This covers the pinned tracks area without extending to collapsed groups
         bar_h = 40
         rect_top = bar_h + 10
-        rect_bottom = int(h * 0.45)
+        rect_bottom = h - 10
 
         overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
 
-        # Semi-transparent fill + solid red border (all 4 sides)
         draw.rectangle(
             [x_left, rect_top, x_right, rect_bottom],
             fill=(255, 50, 50, 30),
-            outline=(255, 60, 60, 200),
+        )
+        draw.line(
+            [(center_x, rect_top), (center_x, rect_bottom)],
+            fill=(255, 70, 70, 220),
             width=3,
         )
 
-        # Corner markers for emphasis (short thick lines at each corner)
-        corner_len = 20
-        corner_w = 4
-        red = (255, 40, 40, 230)
-        for cx, cy in [(x_left, rect_top), (x_right, rect_top),
-                       (x_left, rect_bottom), (x_right, rect_bottom)]:
-            dx = corner_len if cx == x_left else -corner_len
-            dy = corner_len if cy == rect_top else -corner_len
-            draw.line([(cx, cy), (cx + dx, cy)], fill=red, width=corner_w)
-            draw.line([(cx, cy), (cx, cy + dy)], fill=red, width=corner_w)
-
         # Title bar at very top
-        top_ev = evidence[0] if evidence else None
+        top_ev = _pick_title_evidence(evidence or [], focus_track=focus_track, track_hints=track_hints or [])
         if top_ev:
             title = f"{jank_type}  |  {top_ev['name']}@{top_ev['thread']} ({top_ev['dur_ms']}ms)"
         else:
@@ -796,9 +1217,9 @@ def _annotate_detail(filepath, target_ts, vis_start, vis_end, jank_type, evidenc
             small_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
         except Exception:
             small_font = font
-        label = "target_ts focus"
+        label = "target_ts"
         label_x = max(gutter, center_x - 60)
-        draw.text((label_x, rect_bottom + 6), label, fill=(255, 80, 80, 200), font=small_font)
+        draw.text((label_x, bar_h + 6), label, fill=(255, 80, 80, 200), font=small_font)
 
         result = Image.alpha_composite(img, overlay)
         result.convert("RGB").save(str(filepath))
@@ -858,6 +1279,152 @@ def _scroll_to_track(page, slice_search_term):
         time.sleep(0.3)
     except Exception:
         pass
+
+
+def _take_focus_screenshot(page, filepath, anchor_track, track_hints=None, height_ratio=0.72):
+    try:
+        clip = page.evaluate(
+            """(payload) => {
+                const anchorName = String(payload.anchorName || '').trim().toLowerCase();
+                const rawHints = payload.trackHints || [];
+                const trackHints = rawHints
+                    .map(item => String(item || '').trim().toLowerCase())
+                    .filter(Boolean)
+                    .slice(0, 24);
+                const heightRatio = Number(payload.heightRatio || 0.72);
+                const vw = window.innerWidth;
+                const vh = window.innerHeight;
+
+                let canvas = null;
+                let maxArea = 0;
+                document.querySelectorAll('canvas').forEach(c => {
+                    const r = c.getBoundingClientRect();
+                    const area = r.width * r.height;
+                    if (area > maxArea) { maxArea = area; canvas = c; }
+                });
+
+                let cx = 0, cw = vw;
+                if (canvas) {
+                    const cr = canvas.getBoundingClientRect();
+                    cx = Math.max(0, Math.floor(cr.x));
+                    cw = Math.max(100, Math.floor(cr.width));
+                }
+
+                let panelTop = vh;
+                const keywords = ['current selection', 'ftrace events', 'nothing selected'];
+                document.querySelectorAll('div, section').forEach(el => {
+                    const r = el.getBoundingClientRect();
+                    if (r.top < vh * 0.45 || r.height < 20) return;
+                    const text = (el.textContent || '').toLowerCase().trim();
+                    if (text.length > 300) return;
+                    for (const kw of keywords) {
+                        if (text.includes(kw) && r.top < panelTop) {
+                            panelTop = r.top;
+                        }
+                    }
+                });
+
+                let anchorY = Number.POSITIVE_INFINITY;
+                const matches = [];
+                const seenTextTops = new Map();
+                const els = document.querySelectorAll(
+                    '[class*="track"] [class*="title"], [class*="track"] [class*="name"],' +
+                    '[class*="shell"], [class*="pf-track"]'
+                );
+                for (const el of els) {
+                    const text = (el.textContent || '').trim().toLowerCase();
+                    if (!text || text.length > 180) continue;
+                    const r = el.getBoundingClientRect();
+                    if (r.height < 8 || r.bottom < 0 || r.top > panelTop) continue;
+
+                    if (anchorName && text.includes(anchorName)) {
+                        anchorY = Math.min(anchorY, Math.max(0, r.top));
+                    }
+
+                    let matched = false;
+                    for (const hint of trackHints) {
+                        if (hint && (text.includes(hint) || hint.includes(text))) {
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if (!matched && anchorName) {
+                        matched = text.includes(anchorName);
+                    }
+                    if (!matched) continue;
+                    if (seenTextTops.has(text) && Math.abs(r.top - seenTextTops.get(text)) > 32) {
+                        continue;
+                    }
+                    seenTextTops.set(text, r.top);
+                    matches.push({top: r.top, bottom: r.bottom});
+                }
+
+                matches.sort((a, b) => a.top - b.top || a.bottom - b.bottom);
+                const clusters = [];
+                const gapPx = 48;
+                for (const item of matches) {
+                    const last = clusters[clusters.length - 1];
+                    if (last && item.top - last.bottom <= gapPx) {
+                        last.bottom = Math.max(last.bottom, item.bottom);
+                    } else {
+                        clusters.push({top: item.top, bottom: item.bottom});
+                    }
+                }
+
+                let relevantTop = vh;
+                let relevantBottom = 0;
+                if (clusters.length) {
+                    let chosen = clusters[0];
+                    if (anchorY) {
+                        let bestScore = Number.POSITIVE_INFINITY;
+                        for (const cluster of clusters) {
+                            const center = (cluster.top + cluster.bottom) / 2;
+                            const score = Math.abs(center - anchorY);
+                            if (score < bestScore) {
+                                bestScore = score;
+                                chosen = cluster;
+                            }
+                        }
+                    }
+                    relevantTop = chosen.top;
+                    relevantBottom = chosen.bottom;
+                }
+
+                if (!Number.isFinite(anchorY)) {
+                    anchorY = 0;
+                }
+
+                if (!anchorY && relevantBottom > relevantTop) {
+                    anchorY = relevantBottom;
+                }
+                const clipY = Math.max(
+                    0,
+                    Math.floor((relevantBottom > relevantTop ? relevantTop : Math.max(0, anchorY - vh * 0.18)) - 8)
+                );
+                let requestedBottom = Math.floor(clipY + vh * heightRatio);
+                if (relevantBottom > relevantTop) {
+                    requestedBottom = Math.floor(relevantBottom + Math.max(8, vh * 0.012));
+                } else if (anchorY) {
+                    requestedBottom = Math.max(requestedBottom, Math.floor(anchorY + vh * 0.12));
+                }
+                const clipBottom = Math.min(vh, panelTop - 4, requestedBottom);
+                const clipH = Math.max(220, clipBottom - clipY);
+                return {x: cx, y: clipY, width: cw, height: clipH};
+            }""",
+            {
+                "anchorName": anchor_track,
+                "trackHints": track_hints or [],
+                "heightRatio": height_ratio,
+            },
+        )
+        if clip and clip.get("width", 0) > 100 and clip.get("height", 0) > 100:
+            page.screenshot(path=str(filepath), clip=clip)
+            _trim_bottom_idle_rows(filepath)
+            return
+    except Exception as e:
+        print(f"         [focus-clip] fallback: {e}")
+
+    _take_clipped_screenshot(page, filepath, anchor_track)
 
 
 def _take_clipped_screenshot(page, filepath, anchor_track):
@@ -934,12 +1501,14 @@ def _take_clipped_screenshot(page, filepath, anchor_track):
 
         if clip and clip.get("width", 0) > 100 and clip.get("height", 0) > 100:
             page.screenshot(path=str(filepath), clip=clip)
+            _trim_bottom_idle_rows(filepath)
             return
     except Exception as e:
         print(f"         [clip] fallback: {e}")
 
     # Fallback: full viewport
     page.screenshot(path=str(filepath))
+    _trim_bottom_idle_rows(filepath)
 
 
 # ─── File I/O ─────────────────────────────────────────────────────────
